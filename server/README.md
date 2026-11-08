@@ -41,7 +41,7 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 | ツール | 内容 |
 |---|---|
 | `capture_info` | UVC デバイス一覧（driver=uvcvideo のみ。bcm2835-codec/isp 等のプラットフォームノードは除外）・対応フォーマット（text） |
-| `capture_frame` | 1 フレーム取得（image）。YUYV 生取り込み → 可逆 PNG のみ（flate2 deflate 圧縮、`image` クレート / 純Rust）。信号変化を確実に追随するため、画素差分・文字可読性の検証に向く（数百KB）。**MJPEG(JPEG) モードは 2026-11-08 廃止**（先頭ヘッダ破損、フォーマット/信号切替直後に MS2109 の古いノーシグナルカラーバーが残る）。warmup ストリーム破棄付き。`skip=既定2` で先頭フレーム不安定対策（サイズ検証 + 自動リトライ） |
+| `capture_frame` | 1 フレーム取得。YUYV 生取り込み → 可逆 PNG（flate2 deflate 圧縮、`image` クレート / 純Rust）。信号変化を確実に追随するため、画素差分・文字可読性の検証に向く（数百KB）。**MJPEG(JPEG) モードは 2026-11-08 廃止**（先頭ヘッダ破損、フォーマット/信号切替直後に MS2109 の古いノーシグナルカラーバーが残る）。warmup ストリーム破棄付き。`skip=既定2` で先頭フレーム不安定対策（サイズ検証 + 自動リトライ）。**モード追加（2026-11-08）**: `mode=image`（既定、PNG のみ）/ `mode=diff`（前回キャプチャとの変化画素数 % と bbox をテキストのみで返す。画像を送らない低コストな「画面動いた？」確認。ベースラインはデバイスごとにメモリ内、再起動・解像度変更でリセット）/ `mode=both`（統計 + PNG）。`region={x,y,w,h}` で矩形クロップ（境界超過はクランプ、原点外はエラー。diff の計測範囲にもなる）。`diff_threshold`（既定12、0=ビット完全一致。ライブ信号のノイズ対策）。diff は RGB 変換前の YUYV バイト比較（閾値超で Y=個別画素、U/V=ペア2画素に反映） |
 | `hid_status` | GET_INFO。firmware と **usb_status（0x01=ターゲットが HID 認識済み）** を確認。セッション開始時に推奨 |
 | `hid_key_press` | 修飾キー + 同時押し（最大6キー）→ hold → 全解放 |
 | `hid_type_text` | 文字列入力（US 配列 ASCII、shift 自動） |

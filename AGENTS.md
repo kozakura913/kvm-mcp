@@ -46,6 +46,7 @@ ssh -F /home/debian/projects/usb-mcp/.ssh/config pi-mcp.lan
 - CH9329 基板の UART 側（CH340E）→ Pi の `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`、HID 側 → ターゲットPC。
 - MS2109 HDMI キャプチャ → `/dev/video0`（1280×720）。
 - `capture_frame` の出力は YUYV 生取り込み → 可逆 PNG のみ。デバイス MJPEG を使う JPEG モードは不安定（先頭ヘッダ破損・ノーシグナル残像）のため **2026-11-08 に廃止**。経過・再現手順は `memo/20261107-usb-device-status.md`。
+- `capture_frame` にモード追加（2026-11-08）: `mode=diff`（前回キャプチャとの差分統計のみ、画像なし）/ `mode=both`、矩形クロップ `region={x,y,w,h}`、`diff_threshold`（既定12）。diff は YUYV バイト比較（`server/src/diff.rs`）、ベースラインはデバイス単位でメモリ内（サーバー再起動・解像度変更でリセット）。
 - ビルドは Pi Zero では不可能なため、VM 上の Docker で armv6l（musleabi 完全静的リンク）へクロスビルド → `server/deploy.sh` でデプロイ。
 
 ## 詳細メモへの参照

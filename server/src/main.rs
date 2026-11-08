@@ -12,6 +12,7 @@
 mod b64;
 mod capture;
 mod ch9329;
+mod diff;
 mod keys;
 mod png;
 
@@ -30,6 +31,8 @@ const INSTRUCTIONS: &str = "Rig topology: this server runs on a Raspberry Pi (pi
 /dev/video0 is an MS2109 HDMI capture of a target PC's screen; /dev/ttyUSB0 is a CH340E UART \
 feeding a CH9329 that injects keyboard/mouse HID into the target PC over USB. \
 Workflow: capture_frame to see the screen, then hid_* tools to act, then capture again to verify. \
+capture_frame supports mode=diff (text-only change stats vs the previous capture, no image — cheap \
+verify loop) and region {x,y,w,h} (crop a rect, e.g. to read one area at full detail). \
 Absolute mouse positioning is unreliable on the target — use hid_mouse_move (relative) plus \
 captures to steer. Proving keyboard injection works: type 'echo <marker>' + Enter into a terminal \
 on the target and check the capture shows the result. Never worry about bricking the CH9329: \
@@ -39,6 +42,7 @@ struct State {
     video_dev: String,
     hid: Mutex<ch9329::Ch9329>,
     sessions: Mutex<HashSet<String>>,
+    baselines: diff::Baselines,
 }
 
 fn main() {
@@ -52,6 +56,7 @@ fn main() {
         video_dev: video_dev.clone(),
         hid: Mutex::new(ch9329::Ch9329::new(serial_dev.clone(), baud)),
         sessions: Mutex::new(HashSet::new()),
+        baselines: diff::Baselines::new(),
     });
 
     let server = match Server::http(bind.as_str()) {
@@ -330,14 +335,17 @@ fn tool_defs() -> Value {
       },
       {
         "name": "capture_frame",
-        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI) and return it as a lossless compressed PNG: raw YUYV grab -> RGB -> PNG (a few hundred KB). Reliably tracks the live signal, best for pixel-diff/text legibility. A warmup stream is discarded first. NOTE: the device MJPEG path was removed 2026-11-08 (unstable: corrupt headers and stale no-signal frames after signal/format switches); PNG is the only output.",
+        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI) from raw YUYV (always warmup-discarded first). mode=image (default): lossless compressed PNG image block (a few hundred KB), best for pixel-diff/text legibility. mode=diff: compares the grab with the PREVIOUS capture on the same device and returns ONLY text change stats (changed % + bounding box in frame px, no image) — a cheap 'did the screen move?' check between HID actions. mode=both: stats + PNG. Every capture stores its full frame as the new baseline (in-memory; resets on restart or dimension change). Optional region {x,y,w,h} crops the PNG to that rect and scopes diff stats to it. NOTE: the device MJPEG path was removed 2026-11-08 (unstable headers / stale no-signal frames); PNG remains the only image output.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "width": { "type": "integer", "default": 1280 },
             "height": { "type": "integer", "default": 720 },
             "skip": { "type": "integer", "default": 2, "description": "discard N initial frames before the real grab (first buffers of a fresh YUYV stream come out unsettled on this device)" },
-            "device": { "type": "string" }
+            "device": { "type": "string" },
+            "mode": { "type": "string", "enum": ["image", "diff", "both"], "default": "image", "description": "image: PNG only; diff: change stats vs previous capture, NO image; both: stats + PNG" },
+            "region": { "type": "object", "properties": { "x": { "type": "integer", "minimum": 0 }, "y": { "type": "integer", "minimum": 0 }, "w": { "type": "integer", "minimum": 1 }, "h": { "type": "integer", "minimum": 1 } }, "required": ["x", "y", "w", "h"], "description": "crop rect in frame px (origin outside the frame errors, size overruns clamp); also scopes diff-mode stats" },
+            "diff_threshold": { "type": "integer", "default": 12, "minimum": 0, "maximum": 255, "description": "min per-component abs change on the raw YUYV bytes to count as a changed pixel (live HDMI has a few LSBs of noise; 0 = bit-exact)" }
           }
         }
       },
@@ -457,6 +465,36 @@ fn str_arg<'a>(args: &'a Value, name: &str, default: &'a str) -> &'a str {
     args.get(name).and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(default)
 }
 
+/// Parse capture_frame's optional region {x,y,w,h} arg (raw, pre-clamp).
+fn region_arg(args: &Value) -> Result<Option<(u32, u32, u32, u32)>, String> {
+    let r = match args.get("region") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v @ Value::Object(_)) => v,
+        Some(_) => return Err("region must be an object {x, y, w, h}".into()),
+    };
+    let mut vals = [0i64; 4];
+    for (i, k) in ["x", "y", "w", "h"].iter().enumerate() {
+        match r.get(k) {
+            Some(Value::Number(n)) => {
+                vals[i] = n.as_i64().ok_or_else(|| format!("region.{} must be an integer", k))?
+            }
+            Some(Value::String(s)) => {
+                vals[i] = s.parse::<i64>().map_err(|_| format!("region.{} must be an integer", k))?
+            }
+            None => return Err(format!("region.{} is required", k)),
+            Some(_) => return Err(format!("region.{} must be an integer", k)),
+        }
+    }
+    let (x, y, w, h) = (vals[0], vals[1], vals[2], vals[3]);
+    if x < 0 || y < 0 {
+        return Err("region.x/y must be >= 0".into());
+    }
+    if w < 1 || h < 1 {
+        return Err("region.w/h must be >= 1".into());
+    }
+    Ok(Some((x as u32, y as u32, w as u32, h as u32)))
+}
+
 fn sleep_ms(ms: u64) {
     if ms > 0 {
         thread::sleep(Duration::from_millis(ms));
@@ -480,24 +518,110 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             if let Some(f) = args.get("format").and_then(Value::as_str) {
                 if !f.eq_ignore_ascii_case("png") {
                     return Err(format!(
-                        "format '{}' is no longer available: the device MJPEG capture was removed (unstable headers, stale no-signal frames). capture_frame always returns a lossless PNG built from raw YUYV",
+                        "format '{}' is no longer available: the device MJPEG capture was removed (unstable headers, stale no-signal frames). capture_frame image output is always a lossless PNG built from raw YUYV",
                         f
                     ));
                 }
             }
+            let mode = match str_arg(args, "mode", "image").to_ascii_lowercase().as_str() {
+                "image" => "image",
+                "diff" => "diff",
+                "both" => "both",
+                other => {
+                    return Err(format!(
+                        "mode '{}' is invalid: use image (default, PNG only), diff (change stats, no image) or both",
+                        other
+                    ))
+                }
+            };
+            let thresh = int_arg(args, "diff_threshold", 12)?.clamp(0, 255) as i32;
+            let region = region_arg(args)?;
             let dev = str_arg(args, "device", &state.video_dev).to_string();
             let fr = capture::grab_yuyv(&dev, w, h, skip)?;
-            let rgb = png::yuyv_to_rgb(&fr.data, fr.w, fr.h)?;
-            let png_data = png::encode_rgb_png(fr.w, fr.h, &rgb)?;
-            let size = png_data.len();
+            let region = png::normalize_region(region, fr.w, fr.h)?;
+
+            // Baseline bookkeeping: take the device's previous full frame out
+            // of the map, diff the current grab against it (diff/both modes),
+            // and finally store the CURRENT frame as the new baseline (any
+            // mode) — diffs always chain to the previously seen capture.
+            let prev = state.baselines.take(&dev);
+            let diff_note = if mode == "image" {
+                None
+            } else {
+                match prev.as_ref() {
+                    None => Some(String::from(
+                        "no baseline yet for this device — this grab was stored as the baseline, diff stats come from the NEXT capture (use mode=both to also see this frame)",
+                    )),
+                    Some(p) if p.w != fr.w || p.h != fr.h => Some(format!(
+                        "baseline reset: previous capture was {}x{}, this one is {}x{} — no diff this time",
+                        p.w, p.h, fr.w, fr.h
+                    )),
+                    Some(p) => {
+                        let st = diff::diff_yuyv(p, &fr.data, region, thresh)?;
+                        let window = match region {
+                            Some((rx, ry, rw, rh)) => format!("{},{} {}x{}", rx, ry, rw, rh),
+                            None => format!("whole frame {}x{}", fr.w, fr.h),
+                        };
+                        Some(if st.changed == 0 {
+                            format!(
+                                "NO change in {} ({} px compared, threshold={})",
+                                window, st.total, thresh
+                            )
+                        } else {
+                            let (bx, by, bw, bh) = st.bbox.unwrap();
+                            format!(
+                                "CHANGED: {} of {} px ({:.2}%) in {} — bbox x={}, y={}, {}x{} (threshold={})",
+                                st.changed,
+                                st.total,
+                                100.0 * st.changed as f64 / st.total as f64,
+                                window,
+                                bx, by, bw, bh,
+                                thresh
+                            )
+                        })
+                    }
+                }
+            };
+
+            let (png_data, cw, ch) = if mode == "diff" {
+                (None, fr.w, fr.h)
+            } else {
+                // RGB conversion only on the image path (Pi Zero: skip it for diff-only)
+                let rgb = png::yuyv_to_rgb(&fr.data, fr.w, fr.h)?;
+                let (rgb, cw, ch) = match region {
+                    Some((rx, ry, rw, rh)) => png::crop_rgb(&rgb, fr.w, fr.h, rx, ry, rw, rh)?,
+                    None => (rgb, fr.w, fr.h),
+                };
+                (Some(png::encode_rgb_png(cw, ch, &rgb)?), cw, ch)
+            };
+
+            // the current full frame is now this device's baseline (moved in, no copy)
+            state.baselines.put(&dev, diff::SavedFrame { w: fr.w, h: fr.h, yuyv: fr.data });
+
             let adj = if (fr.w, fr.h) != (w, h) { format!(" [device adjusted {}x{} -> {}x{}]", w, h, fr.w, fr.h) } else { String::new() };
-            Ok(vec![
-                text_block(format!(
-                    "captured {}x{} lossless PNG (from raw YUYV){}, {} bytes from {}",
-                    fr.w, fr.h, adj, size, dev
-                )),
-                json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }),
-            ])
+            let region_desc = match region {
+                Some((rx, ry, rw, rh)) => format!(" region x={}, y={}, {}x{}", rx, ry, rw, rh),
+                None => String::new(),
+            };
+            let head = match &png_data {
+                Some(png_data) => format!(
+                    "captured {}x{} lossless PNG (from raw YUYV){}{}, {} bytes from {}",
+                    cw, ch, adj, region_desc, png_data.len(), dev
+                ),
+                None => format!(
+                    "captured {}x{} raw YUYV{} (diff-only mode, no image sent) from {}",
+                    fr.w, fr.h, adj, dev
+                ),
+            };
+            let text = match diff_note {
+                Some(d) => format!("{} | diff vs previous capture: {}", head, d),
+                None => head,
+            };
+            let mut blocks = vec![text_block(text)];
+            if let Some(png_data) = png_data {
+                blocks.push(json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }));
+            }
+            Ok(blocks)
         }
         "hid_status" => {
             let mut hid = lock_hid(state);
