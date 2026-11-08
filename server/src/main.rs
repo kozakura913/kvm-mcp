@@ -18,7 +18,6 @@ mod png;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -40,7 +39,6 @@ struct State {
     video_dev: String,
     hid: Mutex<ch9329::Ch9329>,
     sessions: Mutex<HashSet<String>>,
-    seq: AtomicU32,
 }
 
 fn main() {
@@ -54,7 +52,6 @@ fn main() {
         video_dev: video_dev.clone(),
         hid: Mutex::new(ch9329::Ch9329::new(serial_dev.clone(), baud)),
         sessions: Mutex::new(HashSet::new()),
-        seq: AtomicU32::new(0),
     });
 
     let server = match Server::http(bind.as_str()) {
@@ -328,7 +325,7 @@ fn tool_defs() -> Value {
     json!([
       {
         "name": "capture_info",
-        "description": "List video devices and supported capture formats/resolutions (v4l2-ctl --list-devices / --list-formats-ext).",
+        "description": "List UVC capture devices only (driver uvcvideo; platform nodes like bcm2835-codec/isp are filtered out) and supported capture formats/resolutions for the requested device (v4l2-ctl --info scan / --list-formats-ext).",
         "inputSchema": { "type": "object", "properties": { "device": { "type": "string", "description": "video device path, default /dev/video0" } } }
       },
       {
@@ -484,12 +481,10 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
                 other => return Err(format!("format must be 'jpeg' or 'png' (got '{}')", other)),
             };
             let dev = str_arg(args, "device", &state.video_dev).to_string();
-            let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
             if fmt == "png" {
-                let fr = capture::grab_yuyv(&dev, w, h, skip, seq)?;
+                let fr = capture::grab_yuyv(&dev, w, h, skip)?;
                 let rgb = png::yuyv_to_rgb(&fr.data, fr.w, fr.h)?;
                 let png_data = png::encode_rgb_png(fr.w, fr.h, &rgb)?;
-                let _ = std::fs::remove_file(&fr.path);
                 let size = png_data.len();
                 let adj = if (fr.w, fr.h) != (w, h) { format!(" [device adjusted {}x{} -> {}x{}]", w, h, fr.w, fr.h) } else { String::new() };
                 return Ok(vec![
@@ -500,8 +495,7 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
                     json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }),
                 ]);
             }
-            let fr = capture::grab(&dev, w, h, skip, seq)?;
-            let _ = std::fs::remove_file(&fr.path);
+            let fr = capture::grab(&dev, w, h, skip)?;
             let size = fr.data.len();
             let adj = if (fr.w, fr.h) != (w, h) { format!(" [device adjusted {}x{} -> {}x{}]", w, h, fr.w, fr.h) } else { String::new() };
             Ok(vec![

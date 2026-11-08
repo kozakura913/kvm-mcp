@@ -40,7 +40,7 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 
 | ツール | 内容 |
 |---|---|
-| `capture_info` | v4l2 デバイス一覧・対応フォーマット（text） |
+| `capture_info` | UVC デバイス一覧（driver=uvcvideo のみ。bcm2835-codec/isp 等のプラットフォームノードは除外）・対応フォーマット（text） |
 | `capture_frame` | 1 フレーム取得（image）。**`format=png`（既定）** は YUYV 生取り込み → 可逆 PNG（flate2 deflate 圧縮、`image` クレート / 純Rust）。信号変化を確実に追随するため、画素差分・文字可読性の検証に向く（数百KB）。`format=jpeg` は MJPEG（小さく速いが、フォーマット/信号切替直後に MS2109 の古いノーシグナルカラーバーが残ることがある）。両モードとも warmup ストリーム破棄付き。`skip=既定2` で先頭フレーム破損対策（SOI/EOI 検証 + サイズ検証 + 自動リトライ） |
 | `hid_status` | GET_INFO。firmware と **usb_status（0x01=ターゲットが HID 認識済み）** を確認。セッション開始時に推奨 |
 | `hid_key_press` | 修飾キー + 同時押し（最大6キー）→ hold → 全解放 |

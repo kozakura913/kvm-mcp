@@ -7,7 +7,6 @@
 use std::process::Command;
 
 pub struct Frame {
-    pub path: String,
     pub data: Vec<u8>,
     /// actual (possibly device-adjusted) frame dimensions
     pub w: u32,
@@ -50,10 +49,12 @@ fn parse_fmt(s: &str) -> Option<(u32, u32, String)> {
     Some((wh?.0, wh?.1, fourcc?))
 }
 
-fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32, path: &str) -> Result<(), String> {
+fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32) -> Result<Vec<u8>, String> {
     // NOTE v4l2-ctl semantics (measured 2026-11-07): --stream-skip discards N
     // buffers, then --stream-count buffers are WRITTEN to the output file
     // concatenated. We want exactly ONE frame per call, so count is fixed at 1.
+    // --stream-to=/dev/stdout lets us keep the frame in memory instead of a
+    // local temp file; v4l2-ctl prints its progress spinner to stderr only.
     let out = Command::new("v4l2-ctl")
         .arg("-d")
         .arg(dev)
@@ -61,14 +62,14 @@ fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32, path: &str) -> Res
         .arg("--stream-mmap")
         .arg("--stream-count=1")
         .arg(format!("--stream-skip={}", skip))
-        .arg(format!("--stream-to={}", path))
+        .arg("--stream-to=/dev/stdout")
         .output()
         .map_err(|e| format!("failed to run v4l2-ctl: {}", e))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("v4l2-ctl failed: {}", err.trim()));
     }
-    Ok(())
+    Ok(out.stdout)
 }
 
 fn looks_like_jpeg(b: &[u8]) -> bool {
@@ -81,35 +82,25 @@ fn looks_like_jpeg(b: &[u8]) -> bool {
 /// confirmed for MJPG 2026-11-07: right after a format switch the device
 /// re-negotiates EDID and the first MJPG frames are the stale no-signal
 /// frames even with skip>=2, while the target signal was already live).
-pub fn grab(dev: &str, w: u32, h: u32, skip: u32, seq: u32) -> Result<Frame, String> {
+pub fn grab(dev: &str, w: u32, h: u32, skip: u32) -> Result<Frame, String> {
     let (aw, ah, _fourcc) = negotiate(dev, w, h, "MJPG")?;
-    let path = format!("/tmp/usb-mcp-{}x{}-{}-{}.jpg", aw, ah, std::process::id(), seq);
-    let warm = format!("{}.warm", path);
-    let _ = v4l2_grab(dev, aw, ah, "MJPG", skip + 6, &warm);
-    let _ = std::fs::remove_file(&warm);
+    // Warmup: discard the first stream so the device settles after format switches.
+    let _ = v4l2_grab(dev, aw, ah, "MJPG", skip + 6);
     let mut last_err = String::from("no attempt made");
     let mut cur_skip = skip;
     for _ in 0..3 {
-        let _ = std::fs::remove_file(&path);
-        if let Err(e) = v4l2_grab(dev, aw, ah, "MJPG", cur_skip, &path) {
-            last_err = e;
-            cur_skip += 2;
-            continue;
-        }
-        match std::fs::read(&path) {
-            Ok(data) if looks_like_jpeg(&data) => return Ok(Frame { path, data, w: aw, h: ah }),
+        match v4l2_grab(dev, aw, ah, "MJPG", cur_skip) {
+            Ok(data) if looks_like_jpeg(&data) => return Ok(Frame { data, w: aw, h: ah }),
             Ok(data) => {
-                let _ = std::fs::remove_file(&path);
                 last_err = format!(
                     "frame {}x{} failed JPEG SOI/EOI check ({} bytes) — corrupt MJPG stream header, retrying with skip={}",
                     aw, ah, data.len(), cur_skip + 2
                 );
             }
-            Err(e) => last_err = format!("read {}: {}", path, e),
+            Err(e) => last_err = e,
         }
         cur_skip += 2;
     }
-    let _ = std::fs::remove_file(&path);
     Err(format!(
         "{} — if the target image never arrives, the device may be showing its no-signal pattern",
         last_err
@@ -123,7 +114,7 @@ pub fn grab(dev: &str, w: u32, h: u32, skip: u32, seq: u32) -> Result<Frame, Str
 /// while a settled bar pattern sits ~132). A SEPARATE subsequent invocation is
 /// clean after only ~3 buffers. So: burn buffers with a warmup grab, discard
 /// it, then do the real grab. Retries with deeper skip on short frames.
-pub fn grab_yuyv(dev: &str, w: u32, h: u32, skip: u32, seq: u32) -> Result<Frame, String> {
+pub fn grab_yuyv(dev: &str, w: u32, h: u32, skip: u32) -> Result<Frame, String> {
     let (aw, ah, fourcc) = negotiate(dev, w, h, "YUYV")?;
     if !fourcc.starts_with("YUYV") && !fourcc.starts_with("YUY2") {
         return Err(format!(
@@ -131,51 +122,55 @@ pub fn grab_yuyv(dev: &str, w: u32, h: u32, skip: u32, seq: u32) -> Result<Frame
             w, h, fourcc
         ));
     }
-    let path = format!("/tmp/usb-mcp-{}x{}-{}-{}.yuyv", aw, ah, std::process::id(), seq);
     let need = (aw as usize) * (ah as usize) * 2;
-    let warm = format!("{}.warm", path);
-    let _ = v4l2_grab(dev, aw, ah, "YUYV", skip + 6, &warm);
-    let _ = std::fs::remove_file(&warm);
+    // Warmup: discard the first stream so the device settles after format switches.
+    let _ = v4l2_grab(dev, aw, ah, "YUYV", skip + 6);
     let mut last_err = String::from("no attempt made");
     let mut cur_skip = skip;
     for _ in 0..3 {
-        let _ = std::fs::remove_file(&path);
-        if let Err(e) = v4l2_grab(dev, aw, ah, "YUYV", cur_skip, &path) {
-            last_err = e;
-            cur_skip += 2;
-            continue;
-        }
-        match std::fs::read(&path) {
-            Ok(data) if data.len() == need => return Ok(Frame { path, data, w: aw, h: ah }),
+        match v4l2_grab(dev, aw, ah, "YUYV", cur_skip) {
+            Ok(data) if data.len() == need => return Ok(Frame { data, w: aw, h: ah }),
             Ok(data) => {
-                let _ = std::fs::remove_file(&path);
                 last_err = format!(
                     "yuyv frame {}x{} got {} bytes (expected exactly {}) — stream hiccup, retrying with skip={}",
                     aw, ah, data.len(), need, cur_skip + 2
                 );
             }
-            Err(e) => last_err = format!("read {}: {}", path, e),
+            Err(e) => last_err = e,
         }
         cur_skip += 2;
     }
-    let _ = std::fs::remove_file(&path);
     Err(format!(
         "{} — if the target image never arrives, the device may be showing its no-signal or black frames",
         last_err
     ))
 }
 
-/// Device/format info for humans (v4l2-ctl --list-devices / --list-formats-ext).
+/// Device/format info for humans. The device listing is restricted to UVC
+/// devices (driver "uvcvideo"): on the Pi, a plain `v4l2-ctl --list-devices`
+/// also dumps the bcm2835-codec / bcm2835-isp nodes, which are noise here.
 pub fn info(dev: &str) -> String {
     let mut s = String::new();
-    if let Ok(o) = Command::new("v4l2-ctl").arg("--list-devices").output() {
-        s.push_str("=== v4l2-ctl --list-devices ===\n");
-        s.push_str(&String::from_utf8_lossy(&o.stdout));
-        if !o.stderr.is_empty() {
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
+    s.push_str("=== UVC capture devices (driver uvcvideo) ===\n");
+    match list_uvc_devices() {
+        Ok(nodes) if nodes.is_empty() => s.push_str("(no UVC /dev/video* device found)\n"),
+        Ok(nodes) => {
+            // group nodes by card+bus, preserving device order
+            let mut groups: Vec<((String, String), Vec<String>)> = Vec::new();
+            for (card, bus, path) in nodes {
+                match groups.iter_mut().find(|((c, b), _)| *c == card && *b == bus) {
+                    Some((_, paths)) => paths.push(path),
+                    None => groups.push(((card, bus), vec![path])),
+                }
+            }
+            for ((card, bus), paths) in groups {
+                s.push_str(&format!("{} ({}):\n", card, bus));
+                for p in paths {
+                    s.push_str(&format!("\t{}\n", p));
+                }
+            }
         }
-    } else {
-        s.push_str("(v4l2-ctl --list-devices failed)\n");
+        Err(e) => s.push_str(&format!("(UVC device scan failed: {})\n", e)),
     }
     match Command::new("v4l2-ctl").arg("-d").arg(dev).arg("--list-formats-ext").output() {
         Ok(o) => {
@@ -190,9 +185,58 @@ pub fn info(dev: &str) -> String {
     s
 }
 
+/// Scan /dev/video* and keep only real UVC nodes (driver "uvcvideo").
+/// Returns (card, bus_info, path) in device-number order.
+fn list_uvc_devices() -> Result<Vec<(String, String, String)>, String> {
+    let mut vids: Vec<u32> = std::fs::read_dir("/dev")
+        .map_err(|e| format!("cannot read /dev: {}", e))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_prefix("video").and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect();
+    vids.sort();
+    let mut nodes = Vec::new();
+    for num in vids {
+        let path = format!("/dev/video{}", num);
+        if let Ok(o) = Command::new("v4l2-ctl").arg("-d").arg(&path).arg("--info").output() {
+            if let Some((card, bus)) = uvc_node(&String::from_utf8_lossy(&o.stdout)) {
+                nodes.push((card, bus, path));
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+/// Parse `v4l2-ctl --info` output: Some((card, bus_info)) only if the node is
+/// driven by uvcvideo (i.e. an actual UVC device), None for platform nodes
+/// like bcm2835-codec / bcm2835-isp.
+fn uvc_node(out: &str) -> Option<(String, String)> {
+    let (mut driver, mut card, mut bus) = (None, None, None);
+    for line in out.lines() {
+        let mut kv = line.splitn(2, ':');
+        let (k, v) = match (kv.next(), kv.next()) {
+            (Some(k), Some(v)) => (k.trim(), v.trim()),
+            _ => continue,
+        };
+        match k {
+            "Driver name" => driver = Some(v),
+            "Card type" => card = Some(v),
+            "Bus info" => bus = Some(v),
+            _ => {}
+        }
+    }
+    if driver.as_deref() == Some("uvcvideo") {
+        Some((card.unwrap_or_default().to_string(), bus.unwrap_or_default().to_string()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_fmt;
+    use super::{parse_fmt, uvc_node};
 
     #[test]
     fn parses_negotiated_fmt() {
@@ -216,5 +260,36 @@ Video Capture Format:
     fn rejects_garbage() {
         assert_eq!(parse_fmt(""), None);
         assert_eq!(parse_fmt("no fmt here"), None);
+    }
+
+    #[test]
+    fn uvc_node_accepts_uvcvideo() {
+        // real v4l2-ctl --info shape (MS2109 on the Pi); card contains ':' too
+        let s = "\
+Driver name      : uvcvideo
+Card type        : USB Video: USB Video
+Bus info         : usb-20980000.usb-1.2
+Driver version   : 6.18.50
+Capabilities     : 0x84a00001
+\tVideo Capture
+\tMetadata Capture
+\tStreaming
+";
+        assert_eq!(
+            uvc_node(s),
+            Some(("USB Video: USB Video".to_string(), "usb-20980000.usb-1.2".to_string()))
+        );
+    }
+
+    #[test]
+    fn uvc_node_rejects_platform_nodes() {
+        let s = "\
+Driver name      : bcm2835-isp
+Card type        : bcm2835-isp
+Bus info         : platform:bcm2835-isp
+Driver version   : 6.18.50
+";
+        assert_eq!(uvc_node(s), None);
+        assert_eq!(uvc_node(""), None);
     }
 }
