@@ -1,0 +1,10 @@
+# Cross-build config for the Raspberry Pi Zero (armv6l).
+# Fully static musl binary: runs on any ARMv5TE+ Linux with an ARM EABI userland,
+# independent of the Pi's glibc version.
+#
+# arm-unknown-linux-musleabi is a tier-3 target built with -Zbuild-std, so rustc
+# has no bundled crt objects / unwinder: build.sh stages them from the vendored
+# musl cross toolchain into /work/.crt-stage and we add that dir to the linker path.
+[target.arm-unknown-linux-musleabi]
+linker = "arm-linux-musleabi-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

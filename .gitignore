@@ -1,0 +1,18 @@
+# --- 秘密情報 / ローカル環境依存（AGENTS.md に再構築手順あり） ---
+# 秘密鍵 id_ed25519 を含む。config / known_hosts もこのマシン専用のためコミットしない
+.ssh/
+
+# --- テスト成果物（ターゲット画面のスクショ。増え続けるので基本コミットしない） ---
+# AGENTS.md / docs から参照済みの証拠画像を初版にどうしても残したい場合は
+# git add -f captures/frame-20261107-*.png 等で個別に追加できる
+captures/
+
+# --- Rust ビルド成果物・ダウンロードで再生成できるもの ---
+# server/build.sh が vendor/arm-linux-musleabi-cross.tgz を curl で取得
+# （https://musl.cc/arm-linux-musleabi-cross.tgz）→ 展開してくれるので不要
+server/target/
+server/vendor/
+server/.cargo-cache/
+
+# --- 過去版 build.sh が残した crt ステージング（現行 build.sh は sysroot へ直接コピー） ---
+server/.crt-stage/

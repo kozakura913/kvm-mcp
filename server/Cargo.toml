@@ -1,0 +1,21 @@
+[package]
+name = "usb-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Streamable HTTP MCP server for UVC capture (MS2109) and HID injection (CH9329) on the Pi"
+license = "0BSD OR CC0-1.0"
+
+[dependencies]
+tiny_http = "0.12"
+serde_json = "1"
+libc = "0.2"
+# PNG path only: default-features=false keeps the (tier-3 musl cross) dep tree
+# minimal — image-core + image-png + flate2/miniz_oxide (pure Rust, compressed
+# deflate), no C codecs, no other format decoders.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+strip = true
+codegen-units = 1

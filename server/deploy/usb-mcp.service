@@ -1,0 +1,19 @@
+[Unit]
+Description=usb-mcp Streamable HTTP MCP server (UVC capture + CH9329 HID injection)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/home/pi/usb-mcp/usb-mcp
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=8765
+Environment=VIDEO_DEV=/dev/video0
+Environment=SERIAL_DEV=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+Environment=CH9329_BAUD=9600
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
