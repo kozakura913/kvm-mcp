@@ -330,14 +330,13 @@ fn tool_defs() -> Value {
       },
       {
         "name": "capture_frame",
-        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI). format='png' (DEFAULT) grabs raw YUYV and returns a lossless compressed PNG — reliably reflects the live signal and is best for pixel-diff/text legibility (larger, a few hundred KB). format='jpeg' is NOT RECOMMENDED: it returns the device's MJPEG (small/fast) but the MS2109 can keep emitting stale no-signal frames right after signal loss/format switches. A warmup stream is discarded first on both paths.", 
+        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI) and return it as a lossless compressed PNG: raw YUYV grab -> RGB -> PNG (a few hundred KB). Reliably tracks the live signal, best for pixel-diff/text legibility. A warmup stream is discarded first. NOTE: the device MJPEG path was removed 2026-11-08 (unstable: corrupt headers and stale no-signal frames after signal/format switches); PNG is the only output.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "width": { "type": "integer", "default": 1280 },
             "height": { "type": "integer", "default": 720 },
-            "format": { "type": "string", "enum": ["png", "jpeg"], "default": "png", "description": "png = raw YUYV -> lossless compressed PNG (DEFAULT: reliably live, better for pixel-diff/text legibility, larger+slower); jpeg = device MJPEG — NOT RECOMMENDED: small/fast but the device's stale no-signal frames may linger after signal/format changes" },
-            "skip": { "type": "integer", "default": 2, "description": "discard N initial frames (first MJPG frames can have corrupt headers on this device)" },
+            "skip": { "type": "integer", "default": 2, "description": "discard N initial frames before the real grab (first buffers of a fresh YUYV stream come out unsettled on this device)" },
             "device": { "type": "string" }
           }
         }
@@ -475,35 +474,29 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             let w = int_arg(args, "width", 1280)? as u32;
             let h = int_arg(args, "height", 720)? as u32;
             let skip = int_arg(args, "skip", 2)?.max(0) as u32;
-            let fmt = match str_arg(args, "format", "png").to_ascii_lowercase() {
-                s if s == "jpeg" || s == "jpg" => "jpeg",
-                s if s == "png" => "png",
-                other => return Err(format!("format must be 'jpeg' or 'png' (got '{}')", other)),
-            };
-            let dev = str_arg(args, "device", &state.video_dev).to_string();
-            if fmt == "png" {
-                let fr = capture::grab_yuyv(&dev, w, h, skip)?;
-                let rgb = png::yuyv_to_rgb(&fr.data, fr.w, fr.h)?;
-                let png_data = png::encode_rgb_png(fr.w, fr.h, &rgb)?;
-                let size = png_data.len();
-                let adj = if (fr.w, fr.h) != (w, h) { format!(" [device adjusted {}x{} -> {}x{}]", w, h, fr.w, fr.h) } else { String::new() };
-                return Ok(vec![
-                    text_block(format!(
-                        "captured {}x{} lossless PNG (from raw YUYV){}, {} bytes from {}",
-                        fr.w, fr.h, adj, size, dev
-                    )),
-                    json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }),
-                ]);
+            // The 'format' knob went away with the MJPEG path on 2026-11-08.
+            // A cached-schema client may still send it: 'png' is accepted as a
+            // no-op, jpeg/jpg gets an explicit error rather than silent success.
+            if let Some(f) = args.get("format").and_then(Value::as_str) {
+                if !f.eq_ignore_ascii_case("png") {
+                    return Err(format!(
+                        "format '{}' is no longer available: the device MJPEG capture was removed (unstable headers, stale no-signal frames). capture_frame always returns a lossless PNG built from raw YUYV",
+                        f
+                    ));
+                }
             }
-            let fr = capture::grab(&dev, w, h, skip)?;
-            let size = fr.data.len();
+            let dev = str_arg(args, "device", &state.video_dev).to_string();
+            let fr = capture::grab_yuyv(&dev, w, h, skip)?;
+            let rgb = png::yuyv_to_rgb(&fr.data, fr.w, fr.h)?;
+            let png_data = png::encode_rgb_png(fr.w, fr.h, &rgb)?;
+            let size = png_data.len();
             let adj = if (fr.w, fr.h) != (w, h) { format!(" [device adjusted {}x{} -> {}x{}]", w, h, fr.w, fr.h) } else { String::new() };
             Ok(vec![
                 text_block(format!(
-                    "captured {}x{} JPEG{}, {} bytes from {}",
+                    "captured {}x{} lossless PNG (from raw YUYV){}, {} bytes from {}",
                     fr.w, fr.h, adj, size, dev
                 )),
-                json!({ "type": "image", "data": b64::encode(&fr.data), "mimeType": "image/jpeg" }),
+                json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }),
             ])
         }
         "hid_status" => {

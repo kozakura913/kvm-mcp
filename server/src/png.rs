@@ -1,7 +1,8 @@
 //! PNG path for capture: raw YUYV → RGB → **compressed** PNG, encoded by the
 //! `image` crate (default-features=false, png-only → pure-Rust png +
-//! flate2/miniz_oxide, no C codecs). This is the fallback for the
-//! corrupt-MJPG-header problem noted in AGENTS.md.
+//! flate2/miniz_oxide, no C codecs). This is the only capture output: the
+//! device's MJPEG path was retired 2026-11-08 (unstable), so no JPEG decoder
+//! feature is compiled in.
 
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder};

@@ -49,11 +49,21 @@ Pi Zero (dwc_otg)
 
 ## capture_frame の PNG モード / v4l2 の癖
 
-- `capture_frame` の既定は `png`（YUYV 生取り込み → `image` クレートで可逆圧縮。画素差分・文字可読に最適、数百 KB）。`format:"jpeg"` はデバイス MJPEG（小さく速いが癖あり）。
+- `capture_frame` の出力は PNG のみ（YUYV 生取り込み → `image` クレートで可逆圧縮。画素差分・文字可読に最適、数百 KB）。かつて `format:"jpeg"`（デバイス MJPEG、小さく速いが癖あり）があったが **2026-11-08 に廃止**（下記「JPEG キャプチャモード廃止」参照）。
 - v4l2-ctl の `--stream-count` は「書き込むフレーム数」。`--stream-skip` はその前に捨てる数。`count=skip+1` だと複数フレームが 1 ファイルに連結される。`--stream-count=1` 固定が正しい。
 - MS2109 はフォーマット切替直後のフレームが古いノーシグナルカラーバー／黒／Y 低ノイズで不安定（`skip=2` では足りない）。両モードとも warmup ストリーム（skip+6）を捨ててから実取得するよう修正済み。
 - v4l2 SET_FMT は非対応解像度を黙って調整する（例: 640x360 YUYV → 640x480）。`capture.rs` の `negotiate()`/`parse_fmt()` が `--get-fmt-video` で実寸・実 fourcc を読み戻し、実寸でエンコード。fourcc が YUYV でない場合はエラー。
 - urllib は `http_proxy` 経由でサンドボックスプロキシを通ると空レスポンスで不安定。MCP の E2E は `http.client`（ダイレクト TCP）+ SSH トンネル（`ssh -N -L 127.0.0.1:18779:127.0.0.1:8765`、nohup で起動し最後 kill）で行うこと。
+
+## JPEG キャプチャモード廃止（2026-11-08）
+
+- `capture_frame` の `format:"jpeg"`（デバイス MJPEG をそのまま返す経路）を削除。YUYV 生取り込み → PNG のみになった。
+- 理由: MS2109 の MJPEG は
+  - ストリーム先頭フレームのヘッダが途中で切れて無効なデータになる（SOI/EOI 検証 + skip 増加リトライで対処していた）、
+  - フォーマット/信号切替直後に古いノーシグナルカラーバーフレームが残り続け、リトライでも解消しない（実測経過は `memo/20261108-mouse-behavior.md` 後半。当時は PNG 側で実映像を確認する併用運用になっていた）。
+- コードへの影響: `capture.rs` から MJPG ネゴシエーションと `looks_like_jpeg()` を撤去し、`PIXFMT = "YUYV"` 固定。`image` クレートの png 機能のみで JPEG デコーダは組み込まない。デバイスが YUYV を返さない解像度要求ではエラーになる（fourcc 判定は残してあるので MJPG へフォールバックした場合も検出できる）。
+- 後方互換: スキーマから `format` は削除。古いクライアントが `format:"jpeg"` を送れば明確なエラーを返し、`"png"` は無視して従来どおり PNG を返す。
+- デバイス調査目的で Pi 側から手動に MJPG を採る分には下記の v4l2-ctl 例がそのまま使える（MCP ツールとしては提供しない）。
 
 ## CH340 トラブルシューティング
 

@@ -45,6 +45,7 @@ ssh -F /home/debian/projects/usb-mcp/.ssh/config pi-mcp.lan
 - サーバーは Pi（`pi-mcp.lan`）上で systemd サービス `usb-mcp` として port 8765 で常駐運用。
 - CH9329 基板の UART 側（CH340E）→ Pi の `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`、HID 側 → ターゲットPC。
 - MS2109 HDMI キャプチャ → `/dev/video0`（1280×720）。
+- `capture_frame` の出力は YUYV 生取り込み → 可逆 PNG のみ。デバイス MJPEG を使う JPEG モードは不安定（先頭ヘッダ破損・ノーシグナル残像）のため **2026-11-08 に廃止**。経過・再現手順は `memo/20261107-usb-device-status.md`。
 - ビルドは Pi Zero では不可能なため、VM 上の Docker で armv6l（musleabi 完全静的リンク）へクロスビルド → `server/deploy.sh` でデプロイ。
 
 ## 詳細メモへの参照

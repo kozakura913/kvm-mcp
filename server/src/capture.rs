@@ -1,10 +1,15 @@
 //! UVC capture (MS2109 /dev/video0) via v4l2-ctl.
-//! Notes from AGENTS.md: MJPG headers are sometimes corrupt on this device,
-//! so initial frames are skipped (default skip=2) and the JPEG is validated
-//! (SOI FFD8 / EOI FFD9) before being returned; failed grabs are retried
-//! with a deeper skip.
+//!
+//! Raw YUYV only. The device's MJPEG path was retired 2026-11-08: its stream
+//! headers came out corrupt at the head of a fresh capture and it kept emitting
+//! stale no-signal frames after signal/format switches (measured history in
+//! memo/20261107-usb-device-status.md). Frames are validated by exact size
+//! (w*h*2 bytes) and retried with a deeper skip on a stream hiccup.
 
 use std::process::Command;
+
+/// The only pixel format we drive the device with.
+const PIXFMT: &str = "YUYV";
 
 pub struct Frame {
     pub data: Vec<u8>,
@@ -17,11 +22,11 @@ pub struct Frame {
 /// v4l2 SET_FMT silently ADJUSTS unsupported modes (measured: 640x360 YUYV on
 /// the MS2109 comes back as 640x480), so grab requests must be re-aligned to
 /// the negotiated values. Returns (w, h, fourcc).
-fn negotiate(dev: &str, w: u32, h: u32, fmt: &str) -> Result<(u32, u32, String), String> {
+fn negotiate(dev: &str, w: u32, h: u32) -> Result<(u32, u32, String), String> {
     let out = Command::new("v4l2-ctl")
         .arg("-d")
         .arg(dev)
-        .arg(format!("--set-fmt-video=width={},height={},pixelformat={}", w, h, fmt))
+        .arg(format!("--set-fmt-video=width={},height={},pixelformat={}", w, h, PIXFMT))
         .arg("--get-fmt-video")
         .output()
         .map_err(|e| format!("failed to run v4l2-ctl: {}", e))?;
@@ -49,7 +54,7 @@ fn parse_fmt(s: &str) -> Option<(u32, u32, String)> {
     Some((wh?.0, wh?.1, fourcc?))
 }
 
-fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32) -> Result<Vec<u8>, String> {
+fn v4l2_grab(dev: &str, w: u32, h: u32, skip: u32) -> Result<Vec<u8>, String> {
     // NOTE v4l2-ctl semantics (measured 2026-11-07): --stream-skip discards N
     // buffers, then --stream-count buffers are WRITTEN to the output file
     // concatenated. We want exactly ONE frame per call, so count is fixed at 1.
@@ -58,7 +63,7 @@ fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32) -> Result<Vec<u8>,
     let out = Command::new("v4l2-ctl")
         .arg("-d")
         .arg(dev)
-        .arg(format!("--set-fmt-video=width={},height={},pixelformat={}", w, h, fmt))
+        .arg(format!("--set-fmt-video=width={},height={},pixelformat={}", w, h, PIXFMT))
         .arg("--stream-mmap")
         .arg("--stream-count=1")
         .arg(format!("--stream-skip={}", skip))
@@ -72,42 +77,7 @@ fn v4l2_grab(dev: &str, w: u32, h: u32, fmt: &str, skip: u32) -> Result<Vec<u8>,
     Ok(out.stdout)
 }
 
-fn looks_like_jpeg(b: &[u8]) -> bool {
-    b.len() > 512 && b[0] == 0xFF && b[1] == 0xD8 && b[b.len() - 2] == 0xFF && b[b.len() - 1] == 0xD9
-}
-
-/// Grab one frame; retries with deeper skip if the frame comes out corrupt.
-///
-/// A warmup grab precedes the real one (same reasoning as grab_yuyv, and
-/// confirmed for MJPG 2026-11-07: right after a format switch the device
-/// re-negotiates EDID and the first MJPG frames are the stale no-signal
-/// frames even with skip>=2, while the target signal was already live).
-pub fn grab(dev: &str, w: u32, h: u32, skip: u32) -> Result<Frame, String> {
-    let (aw, ah, _fourcc) = negotiate(dev, w, h, "MJPG")?;
-    // Warmup: discard the first stream so the device settles after format switches.
-    let _ = v4l2_grab(dev, aw, ah, "MJPG", skip + 6);
-    let mut last_err = String::from("no attempt made");
-    let mut cur_skip = skip;
-    for _ in 0..3 {
-        match v4l2_grab(dev, aw, ah, "MJPG", cur_skip) {
-            Ok(data) if looks_like_jpeg(&data) => return Ok(Frame { data, w: aw, h: ah }),
-            Ok(data) => {
-                last_err = format!(
-                    "frame {}x{} failed JPEG SOI/EOI check ({} bytes) — corrupt MJPG stream header, retrying with skip={}",
-                    aw, ah, data.len(), cur_skip + 2
-                );
-            }
-            Err(e) => last_err = e,
-        }
-        cur_skip += 2;
-    }
-    Err(format!(
-        "{} — if the target image never arrives, the device may be showing its no-signal pattern",
-        last_err
-    ))
-}
-
-/// Grab one raw YUYV frame (w*h*2 bytes); used for the PNG path.
+/// Grab one raw YUYV frame (w*h*2 bytes); the only capture path (PNG output).
 ///
 /// Measured behavior (2026-11-07): right after a format switch the first
 /// buffers of a fresh YUYV stream come out unsettled (dark/garbage, Y-avg ~42
@@ -115,20 +85,20 @@ pub fn grab(dev: &str, w: u32, h: u32, skip: u32) -> Result<Frame, String> {
 /// clean after only ~3 buffers. So: burn buffers with a warmup grab, discard
 /// it, then do the real grab. Retries with deeper skip on short frames.
 pub fn grab_yuyv(dev: &str, w: u32, h: u32, skip: u32) -> Result<Frame, String> {
-    let (aw, ah, fourcc) = negotiate(dev, w, h, "YUYV")?;
+    let (aw, ah, fourcc) = negotiate(dev, w, h)?;
     if !fourcc.starts_with("YUYV") && !fourcc.starts_with("YUY2") {
         return Err(format!(
-            "device does not support YUYV at {}x{} (negotiated pixelformat '{}' instead) — check capture_info for supported sizes",
+            "device does not support YUYV at {}x{} (negotiated pixelformat '{}' instead) — check capture_info for supported sizes. MJPEG is not captured even if the device offers it (retired 2026-11-08: unstable stream headers / stale no-signal frames)",
             w, h, fourcc
         ));
     }
     let need = (aw as usize) * (ah as usize) * 2;
     // Warmup: discard the first stream so the device settles after format switches.
-    let _ = v4l2_grab(dev, aw, ah, "YUYV", skip + 6);
+    let _ = v4l2_grab(dev, aw, ah, skip + 6);
     let mut last_err = String::from("no attempt made");
     let mut cur_skip = skip;
     for _ in 0..3 {
-        match v4l2_grab(dev, aw, ah, "YUYV", cur_skip) {
+        match v4l2_grab(dev, aw, ah, cur_skip) {
             Ok(data) if data.len() == need => return Ok(Frame { data, w: aw, h: ah }),
             Ok(data) => {
                 last_err = format!(
@@ -253,6 +223,8 @@ Video Capture Format:
     #[test]
     fn parses_adjusted_fourcc() {
         let s = "Width/Height : 1280/720\nPixel Format : 'MJPG' (Motion-JPEG)\n";
+        // device falling back to MJPG is what parse_fmt must report so
+        // grab_yuyv can reject it (MJPEG itself is no longer captured)
         assert_eq!(parse_fmt(s), Some((1280, 720, "MJPG".to_string())));
     }
 
