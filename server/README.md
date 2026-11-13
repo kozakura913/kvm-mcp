@@ -22,11 +22,17 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
   "mcp": {
     "usb": {
       "type": "remote",
-      "url": "http://pi-mcp.lan:8765/mcp"
+      "url": "http://pi-mcp.lan:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:USB_MCP_TOKEN}"
+      }
     }
   }
 }
 ```
+
+`USB_MCP_TOKEN` はクライアント側の環境変数として設定する（認証を有効にした場合。次節参照）。
+認証を無効のままなら `headers` は不要。
 
 > **ccserver サンドボックスからの注意**: この VM からの通常の HTTP はサンドボックスの
 > 透過プロキシに interception され port 8765 では 502 になる。その場合は
@@ -35,6 +41,55 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 > ssh -F ../.ssh/config -f -N -L 18766:127.0.0.1:8765 pi-mcp.lan
 > # → url: http://127.0.0.1:18766/mcp
 > ```
+
+## 認証（Bearer トークン）
+
+`MCP_AUTH_TOKEN` を設定すると、`POST/GET/DELETE /mcp`（と互換用の `POST /`）に
+`Authorization: Bearer <token>` が必須になる。`OPTIONS`（CORS preflight）と
+`GET /` の情報ページは認証不要。
+
+- 未設定または空: 認証なしで動作し、起動時に journal へ警告を出す（後方互換）
+- トークン不一致・ヘッダ欠落: `401` + `WWW-Authenticate: Bearer realm="usb-mcp"`
+  （ヘッダはあるが値が違う場合は `error="invalid_token"` 付き）。
+  認証チェックは JSON-RPC 処理より前に行われ、セッションもデバイスも触らない
+- 比較は定数時間。トークン自体はログに出さない
+- 16 文字未満のトークンは起動時に警告（拒否はしない。`openssl rand -hex 32` 推奨）
+
+### Pi での設定
+
+```bash
+# 1. トークンを生成して /etc/usb-mcp/env に保存（既存ファイルは上書きしない）
+ssh -F ../.ssh/config pi-mcp.lan '
+  sudo install -d -m 700 /etc/usb-mcp
+  if [ ! -s /etc/usb-mcp/env ]; then
+    printf "MCP_AUTH_TOKEN=%s\n" "$(openssl rand -hex 32)" | sudo sh -c 'umask 077; cat > /etc/usb-mcp/env'
+  fi
+  sudo cat /etc/usb-mcp/env
+  sudo systemctl restart usb-mcp'
+
+# 2. 表示されたトークンをクライアント側の環境変数へ
+export USB_MCP_TOKEN=<表示された値>
+```
+
+systemd unit は `EnvironmentFile=-/etc/usb-mcp/env` を読む（`-` 付きなので未作成でも起動する）。
+`deploy.sh` はこのファイルを作成・上書きしない。トークンを変えたら env ファイルを更新して
+`sudo systemctl restart usb-mcp` する（既存セッションは無効になる）。
+
+確認例（SSH トンネル利用時は `127.0.0.1:18766`）:
+
+```bash
+curl -i -X POST http://pi-mcp.lan:8765/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# → HTTP/1.1 401 Unauthorized, WWW-Authenticate: Bearer realm="usb-mcp"
+
+curl -i -X POST http://pi-mcp.lan:8765/mcp \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $USB_MCP_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# → HTTP/1.1 200 OK, Mcp-Session-Id: ...
+```
+
+> 平文 HTTP ではトークンが LAN 上をそのまま流れる。信頼できないネットワークでは
+> 上記の SSH ポートフォワードか TLS リバースプロキシを使うこと。
 
 ## ツール一覧（12個）
 
@@ -111,6 +166,8 @@ BUILD_DOCKER_ARGS='-e CARGO_HTTP_CAINFO=/run/ccserver-ca.pem -e SSL_CERT_FILE=/r
   の単一応答**（SSE 配信はしないので `GET /mcp` は spec 通り 405 を返す）
 - `initialize` で `Mcp-Session-Id` を発行（以後の要求は必須、不明はエラー）。
   `DELETE /mcp` でセッション破棄。CORS はすべて許可
+- `MCP_AUTH_TOKEN` 設定時は `/mcp` に `Authorization: Bearer` を要求。未認証は
+  `401` + `WWW-Authenticate`（`OPTIONS` と `GET /` は対象外）
 - protocolVersion は 2025-06-18 / 2025-03-26 / 2024-11-05 / 2024-10-07 に対応
 
 ## ディレクトリ
@@ -118,6 +175,7 @@ BUILD_DOCKER_ARGS='-e CARGO_HTTP_CAINFO=/run/ccserver-ca.pem -e SSL_CERT_FILE=/r
 ```
 server/
   src/main.rs      HTTP + JSON-RPC + ツールディスパッチ
+  src/auth.rs      Bearer トークン認証（定数時間比較）+ 単体テスト
   src/ch9329.rs    UART ドライバ（フレーム生成 / ACK 解析 / 危険 CMD 拒否）+ 単体テスト
   src/capture.rs   v4l2-ctl ラッパー（YUYV 生フレームのみ、サイズ検証 + skip 増加リトライ）
   src/png.rs       YUYV→RGB + `image`（png のみ）で圧縮 PNG エンコード + 単体テスト

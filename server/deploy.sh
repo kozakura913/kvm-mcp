@@ -16,6 +16,10 @@ $SSH 'mkdir -p ~/usb-mcp'
 $SCP "$BIN" "$SSH_TARGET":~/usb-mcp/usb-mcp.new
 $SSH 'chmod +x ~/usb-mcp/usb-mcp.new'
 
+# token directory for MCP_AUTH_TOKEN; the env file itself is never written by
+# this script (an existing token must survive redeploys)
+$SSH 'sudo install -d -m 700 /etc/usb-mcp'
+
 # stop any stray nohup instance, then install the systemd unit.
 # NOTE: `restart` (not `enable --now`): the Restart=always auto-restart after
 # pkill can win the race against the mv below and relaunch the OLD inode —

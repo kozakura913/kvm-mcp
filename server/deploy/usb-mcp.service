@@ -6,6 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 User=pi
+# Optional MCP_AUTH_TOKEN=... (0600). Missing file = bearer auth disabled.
+EnvironmentFile=-/etc/usb-mcp/env
 ExecStart=/home/pi/usb-mcp/usb-mcp
 Environment=MCP_HOST=0.0.0.0
 Environment=MCP_PORT=8765
