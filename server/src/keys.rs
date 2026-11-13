@@ -163,6 +163,25 @@ pub fn mouse_button_bit(name: &str) -> Option<u8> {
     })
 }
 
+/// Human-readable summary of a CH9329 mouse-button bitmask.
+pub fn mouse_buttons_desc(bits: u8) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    if bits & 0x01 != 0 {
+        names.push("left");
+    }
+    if bits & 0x02 != 0 {
+        names.push("right");
+    }
+    if bits & 0x04 != 0 {
+        names.push("middle");
+    }
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join("+")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +213,7 @@ mod tests {
         assert_eq!(media_bit("mute").unwrap(), (1, 0x04));
         assert_eq!(media_bit("www_back").unwrap(), (2, 0x10));
         assert_eq!(mouse_button_bit("middle").unwrap(), 0x04);
+        assert_eq!(mouse_buttons_desc(0), "none");
+        assert_eq!(mouse_buttons_desc(0x01 | 0x04), "left+middle");
     }
 }

@@ -33,6 +33,9 @@ feeding a CH9329 that injects keyboard/mouse HID into the target PC over USB. \
 Workflow: capture_frame to see the screen, then hid_* tools to act, then capture again to verify. \
 capture_frame supports mode=diff (text-only change stats vs the previous capture, no image — cheap \
 verify loop) and region {x,y,w,h} (crop a rect, e.g. to read one area at full detail). \
+hid_mouse_click action=press holds a mouse button DOWN across tool calls (moves/scrolled frames keep \
+it pressed) until action=release on the same button or hid_mouse_release; plain click still \
+presses+releases within the call. \
 Absolute mouse positioning is unreliable on the target — use hid_mouse_move (relative) plus \
 captures to steer. Proving keyboard injection works: type 'echo <marker>' + Enter into a terminal \
 on the target and check the capture shows the result. Never worry about bricking the CH9329: \
@@ -58,6 +61,16 @@ fn main() {
         sessions: Mutex::new(HashSet::new()),
         baselines: diff::Baselines::new(),
     });
+
+    // A previous server process may have died while a mouse button was held;
+    // send a zero-button frame so the target does not stay stuck in a drag.
+    // Best effort: the serial device may not be plugged in yet at boot.
+    {
+        let mut hid = state.hid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = hid.mouse_release_all() {
+            eprintln!("usb-mcp: startup mouse-button release failed (ignored): {}", e);
+        }
+    }
 
     let server = match Server::http(bind.as_str()) {
         Ok(s) => s,
@@ -321,6 +334,7 @@ fn tool_names() -> Vec<&'static str> {
         "hid_media_key",
         "hid_mouse_move",
         "hid_mouse_click",
+        "hid_mouse_release",
         "hid_mouse_scroll",
         "hid_mouse_abs_move",
     ]
@@ -410,15 +424,21 @@ fn tool_defs() -> Value {
       },
       {
         "name": "hid_mouse_click",
-        "description": "Mouse button click (left/right/middle) via relative frames. Use hid_mouse_move + captures first to aim at the visible element.",
+        "description": "Mouse button action (left/right/middle) via relative frames. action=click (default) presses and releases within this call after hold_ms; action=press holds the button DOWN across tool calls (drag/long-press) until action=release on the same button or hid_mouse_release; action=release lifts that button. While a button is held, hid_mouse_move/hid_mouse_scroll keep it pressed. Use hid_mouse_move + captures first to aim at the visible element.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" },
-            "double": { "type": "boolean", "default": false },
-            "hold_ms": { "type": "integer", "default": 80, "minimum": 10, "maximum": 3000 }
+            "action": { "type": "string", "enum": ["click", "press", "release"], "default": "click", "description": "click: press+release here; press: hold down across calls; release: lift this button" },
+            "double": { "type": "boolean", "default": false, "description": "double-click (only with action=click)" },
+            "hold_ms": { "type": "integer", "default": 80, "minimum": 10, "maximum": 3000, "description": "press duration for action=click" }
           }
         }
+      },
+      {
+        "name": "hid_mouse_release",
+        "description": "Release ALL held mouse buttons (sends a zero-button frame). Safe no-op when nothing is held; use it to recover after an error or interrupted drag.",
+        "inputSchema": { "type": "object", "properties": {} }
       },
       {
         "name": "hid_mouse_scroll",
@@ -630,6 +650,12 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             if info.usb_status == 0 {
                 s.push_str("\nHID injection is currently NOT possible: CH9329's USB side is not enumerated by the target.");
             }
+            if hid.held_buttons() != 0 {
+                s.push_str(&format!(
+                    "\nmouse buttons currently HELD: {} (release with hid_mouse_click action=release or hid_mouse_release)",
+                    keys::mouse_buttons_desc(hid.held_buttons())
+                ));
+            }
             Ok(vec![text_block(s)])
         }
         "hid_key_press" => {
@@ -749,28 +775,65 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             while dx != 0 || dy != 0 {
                 let sx = dx.clamp(-127, 127) as i8;
                 let sy = dy.clamp(-127, 127) as i8;
-                hid.mouse_rel(0, sx, sy, 0)?;
+                hid.mouse_move_rel(sx, sy)?;
                 dx -= sx as i32;
                 dy -= sy as i32;
                 frames += 1;
                 sleep_ms(10);
             }
-            Ok(vec![text_block(format!("relative move ({},{}) in {} frame(s)", int_arg(args, "dx", 0)?, int_arg(args, "dy", 0)?, frames))])
+            let held = hid.held_buttons();
+            Ok(vec![text_block(format!(
+                "relative move ({},{}) in {} frame(s){}",
+                int_arg(args, "dx", 0)?,
+                int_arg(args, "dy", 0)?,
+                frames,
+                if held != 0 { format!(" [holding {}]", keys::mouse_buttons_desc(held)) } else { String::new() }
+            ))])
         }
         "hid_mouse_click" => {
             let button = str_arg(args, "button", "left");
             let bit = keys::mouse_button_bit(button).ok_or_else(|| format!("unknown button: {}", button))?;
+            let action = str_arg(args, "action", "click");
             let double = args.get("double").and_then(Value::as_bool).unwrap_or(false);
             let hold = int_arg(args, "hold_ms", 80)?.clamp(10, 3000) as u64;
             let mut hid = lock_hid(state);
-            let cycles = if double { 2 } else { 1 };
-            for _ in 0..cycles {
-                hid.mouse_rel(bit, 0, 0, 0)?;
-                sleep_ms(hold);
-                hid.mouse_rel(0, 0, 0, 0)?;
-                sleep_ms(120);
+            match action {
+                "press" => {
+                    hid.mouse_press(bit)?;
+                    Ok(vec![text_block(format!(
+                        "{} button pressed and HELD across calls (currently held: {}) — release with hid_mouse_click action=release or hid_mouse_release",
+                        button,
+                        keys::mouse_buttons_desc(hid.held_buttons())
+                    ))])
+                }
+                "release" => {
+                    hid.mouse_release(bit)?;
+                    Ok(vec![text_block(format!(
+                        "{} button released (currently held: {})",
+                        button,
+                        keys::mouse_buttons_desc(hid.held_buttons())
+                    ))])
+                }
+                "click" => {
+                    let cycles = if double { 2 } else { 1 };
+                    for _ in 0..cycles {
+                        hid.mouse_press(bit)?;
+                        sleep_ms(hold);
+                        hid.mouse_release(bit)?;
+                        sleep_ms(120);
+                    }
+                    Ok(vec![text_block(format!("{} {}click", button, if double { "double-" } else { "" }))])
+                }
+                other => Err(format!(
+                    "action '{}' is invalid: use click (default), press (hold across calls) or release",
+                    other
+                )),
             }
-            Ok(vec![text_block(format!("{} {}click", button, if double { "double-" } else { "" }))])
+        }
+        "hid_mouse_release" => {
+            let mut hid = lock_hid(state);
+            hid.mouse_release_all()?;
+            Ok(vec![text_block("all mouse buttons released")])
         }
         "hid_mouse_scroll" => {
             let mut amount = int_arg(args, "amount", 0)?.clamp(-50, 50) as i32;
@@ -781,12 +844,18 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             let mut frames = 0;
             while amount != 0 {
                 let step = amount.clamp(-127, 127) as i8;
-                hid.mouse_rel(0, 0, 0, step)?;
+                hid.mouse_scroll_rel(step)?;
                 amount -= step as i32;
                 frames += 1;
                 sleep_ms(20);
             }
-            Ok(vec![text_block(format!("scroll {} ticks in {} frame(s)", int_arg(args, "amount", 0)?, frames))])
+            let held = hid.held_buttons();
+            Ok(vec![text_block(format!(
+                "scroll {} ticks in {} frame(s){}",
+                int_arg(args, "amount", 0)?,
+                frames,
+                if held != 0 { format!(" [holding {}]", keys::mouse_buttons_desc(held)) } else { String::new() }
+            ))])
         }
         "hid_mouse_abs_move" => {
             let x = int_arg(args, "x", 0)?.clamp(0, 10000) as u32;
