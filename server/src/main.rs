@@ -20,13 +20,19 @@ mod png;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const LATEST_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: [&str; 4] = ["2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+
+/// Write end of the self-pipe used by the SIGTERM/SIGINT handler. -1 while no
+/// handler is installed. The handler only forwards the signal number; the
+/// actual HID release runs in the `shutdown-signal` thread.
+static SHUTDOWN_SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 
 const INSTRUCTIONS: &str = "Rig topology: this server runs on a Raspberry Pi (pi-mcp.lan). \
 /dev/video0 is an MS2109 HDMI capture of a target PC's screen; /dev/ttyUSB0 is a CH340E UART \
@@ -66,15 +72,13 @@ fn main() {
         auth,
     });
 
-    // A previous server process may have died while a mouse button was held;
-    // send a zero-button frame so the target does not stay stuck in a drag.
-    // Best effort: the serial device may not be plugged in yet at boot.
-    {
-        let mut hid = state.hid.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = hid.mouse_release_all() {
-            eprintln!("usb-mcp: startup mouse-button release failed (ignored): {}", e);
-        }
-    }
+    // A previous server process may have died mid-injection. Release both
+    // keyboard keys and mouse buttons so the target is not left with a stuck
+    // key or an active drag. Best effort: the serial device may not be
+    // plugged in yet at boot. Install the signal handler first so a SIGTERM
+    // during this window still runs the same cleanup.
+    install_shutdown_handler(Arc::clone(&state));
+    cleanup_hid(&state, "startup");
 
     let server = match Server::http(bind.as_str()) {
         Ok(s) => s,
@@ -105,6 +109,175 @@ fn main() {
                 eprintln!("usb-mcp: handler panicked: {:?}", e);
             }
         });
+    }
+}
+
+// ------------------------------------------------------- HID cleanup / signals
+
+/// Best-effort release of keyboard keys and mouse buttons. Called at startup
+/// (state left by a previous process) and on SIGTERM/SIGINT. A wedged HID
+/// transaction must not block shutdown forever, so the mutex is waited for at
+/// most two seconds.
+fn cleanup_hid(state: &State, reason: &str) {
+    let mut hid = match lock_hid_timeout(state, Duration::from_secs(2)) {
+        Some(hid) => hid,
+        None => {
+            eprintln!(
+                "usb-mcp: {} HID cleanup skipped: serial port is busy",
+                reason
+            );
+            return;
+        }
+    };
+    let mut errors = Vec::new();
+    if let Err(e) = hid.release_all_keys() {
+        errors.push(format!("keyboard: {}", e));
+    }
+    if let Err(e) = hid.mouse_release_all() {
+        errors.push(format!("mouse: {}", e));
+    }
+    if errors.is_empty() {
+        println!(
+            "usb-mcp: {} HID cleanup: keyboard keys and mouse buttons released",
+            reason
+        );
+    } else {
+        eprintln!(
+            "usb-mcp: {} HID cleanup incomplete: {}",
+            reason,
+            errors.join("; ")
+        );
+    }
+}
+
+fn lock_hid_timeout<'a>(
+    state: &'a State,
+    timeout: Duration,
+) -> Option<std::sync::MutexGuard<'a, ch9329::Ch9329>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match state.hid.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// Async-signal-safe: only forward the signal number through the self-pipe.
+/// The real work (opening the tty, sending HID reports) runs in a normal
+/// thread, never in the handler.
+extern "C" fn on_shutdown_signal(sig: libc::c_int) {
+    let fd = SHUTDOWN_SIGNAL_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = sig as u8;
+        unsafe {
+            libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+fn restore_default_signal_handlers() {
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut dfl.sa_mask);
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGTERM, &dfl, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut());
+    }
+}
+
+/// Install SIGTERM/SIGINT handling before the server threads are spawned.
+///
+/// `sigaction` is used (not a blocked mask + `sigwait`) so child processes
+/// such as `v4l2-ctl` keep the default signal disposition: handlers are reset
+/// on exec, while a blocked signal mask would be inherited. The handler only
+/// writes to a self-pipe; a dedicated thread performs the HID cleanup and
+/// exits.
+fn install_shutdown_handler(state: Arc<State>) {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        eprintln!(
+            "usb-mcp: cannot create shutdown pipe; SIGTERM/SIGINT HID cleanup disabled: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    SHUTDOWN_SIGNAL_FD.store(write_fd, Ordering::Relaxed);
+
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_shutdown_signal as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    let term = unsafe { libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) };
+    let int = unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) };
+    if term != 0 || int != 0 {
+        eprintln!(
+            "usb-mcp: cannot install SIGTERM/SIGINT handler; HID cleanup on shutdown disabled: {}",
+            std::io::Error::last_os_error()
+        );
+        restore_default_signal_handlers();
+        SHUTDOWN_SIGNAL_FD.store(-1, Ordering::Relaxed);
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return;
+    }
+
+    let spawned = thread::Builder::new()
+        .name("shutdown-signal".to_string())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                let n = unsafe {
+                    libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1)
+                };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    eprintln!("usb-mcp: shutdown-signal read failed: {}", e);
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+                let sig = byte[0] as libc::c_int;
+                eprintln!(
+                    "usb-mcp: received signal {} — releasing HID state before exit",
+                    sig
+                );
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cleanup_hid(&state, "shutdown")
+                }));
+                std::process::exit(0);
+            }
+            restore_default_signal_handlers();
+            SHUTDOWN_SIGNAL_FD.store(-1, Ordering::Relaxed);
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+        });
+
+    if let Err(e) = spawned {
+        eprintln!("usb-mcp: cannot start shutdown-signal thread: {}", e);
+        restore_default_signal_handlers();
+        SHUTDOWN_SIGNAL_FD.store(-1, Ordering::Relaxed);
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 }
 
@@ -924,4 +1097,37 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
 
 fn text_block(t: impl Into<String>) -> Value {
     json!({ "type": "text", "text": t.into() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(serial: &str) -> State {
+        State {
+            video_dev: "/dev/null".into(),
+            hid: Mutex::new(ch9329::Ch9329::new(serial.into(), 9600)),
+            sessions: Mutex::new(HashSet::new()),
+            baselines: diff::Baselines::new(),
+            auth: auth::BearerAuth::from_env(),
+        }
+    }
+
+    #[test]
+    fn cleanup_is_best_effort_without_a_serial_device() {
+        let state = test_state("/nonexistent-usb-mcp-test");
+        // Must log and return, not panic or block forever, when the tty is
+        // missing (the normal boot case before the CH340 enumerates).
+        cleanup_hid(&state, "test");
+    }
+
+    #[test]
+    fn lock_hid_timeout_gives_up_when_the_mutex_is_held() {
+        let state = test_state("/nonexistent-usb-mcp-test");
+        let guard = state.hid.lock().unwrap();
+        let start = Instant::now();
+        assert!(lock_hid_timeout(&state, Duration::from_millis(50)).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        drop(guard);
+    }
 }
