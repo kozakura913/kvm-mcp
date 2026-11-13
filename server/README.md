@@ -36,7 +36,7 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 > # → url: http://127.0.0.1:18766/mcp
 > ```
 
-## ツール一覧（11個）
+## ツール一覧（12個）
 
 | ツール | 内容 |
 |---|---|
@@ -48,7 +48,8 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 | `hid_release_keys` | 全キー解放（固着キー救出用、安全） |
 | `hid_media_key` | メディアキー（CMD 0x03）。**ACPI（power/sleep）は意図的に非実装** |
 | `hid_mouse_move` | 相対移動（推奨）。±127 で自動分割 |
-| `hid_mouse_click` | 左/右/中クリック（相対フレーム経由） |
+| `hid_mouse_click` | 左/右/中クリック（相対フレーム経由）。`action=click`（既定）は `hold_ms` 後に解放、`action=press` は**ツールコールをまたいで押下を保持**（ドラッグ用）、`action=release` でそのボタンを解放。保持中は `hid_mouse_move` / `hid_mouse_scroll` の全フレームにもボタンビットが OR される |
+| `hid_mouse_release` | 保持中の**全マウスボタンを解放**（0 ボタンフレーム送信）。何も押していなければ安全な no-op。エラーや中断後の復旧用 |
 | `hid_mouse_scroll` | ホイール |
 | `hid_mouse_abs_move` | 絶対配置。**ターゲットでズレが実測されているため警告付き。基本は相対移動 + キャプチャで合わせる** |
 
@@ -56,7 +57,8 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 
 - CH9329 の**隠しコマンド 0x07/0x0D/0x0E および 0x0F を超える CMD はサーバー側で拒否**
   （V1.4 ファームウェアで USB 側が消える事故の教訓、`third-party/wch/ch9329-spec.md` §5 警告）。拒否は単体テスト済み
-- ボタン/ホイールは絶対フレームでは送らない（本基板では Linux に到達しないため、実測（§13））
+- ボタン/ホイールは絶対フレームでは送らない（本基板では Linux に到達しないため、実測（§13））。絶対フレームのボタンバイトは保持中ビットのミラーのみ
+- マウス押下状態はサーバー（`Ch9329.held_buttons`）が保持し、移動・スクロールを含む全相対フレームに含める。`action=press` の押しっぱなしは次回以降のツールコールでも維持され、`action=release` / `hid_mouse_release` で解除する。サーバー起動時にも 0 ボタンフレームを best-effort 送信して残留押下を掃除する（デバイス未接続時はログのみ）
 - 全フレーム SUM は自動計算。SUM 不一致はターゲット注入ゼロで E4 として返る
 - ACK 待ち 500ms。ゴミバイトからの再同期、V1.4 の 5 バイト短縮 ACK both 対応
 

@@ -5,8 +5,8 @@
 //! - CMD 0x07 / 0x0D / 0x0E and any CMD > 0x0F are REFUSED: on V1.4 firmware
 //!   these are hidden ISP/bootloader commands that make the USB side vanish
 //!   (recovery requires physically unplugging the CH9329).
-//! - Buttons/wheel are only ever sent via relative-mouse frames (CMD 0x05);
-//!   in absolute frames (CMD 0x04) they never reach the Linux host (spec §13).
+//! - Buttons/wheel only take effect via relative-mouse frames (CMD 0x05);
+//!   absolute frames (CMD 0x04) are move-only (spec §13).
 
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -44,6 +44,10 @@ pub struct Ch9329 {
     path: String,
     baud: u32,
     file: Option<std::fs::File>,
+    /// Mouse button bits currently held down (bit0 left / bit1 right / bit2 middle).
+    /// Every relative-mouse frame carries the full button state, so a move or
+    /// scroll must include these bits or it would implicitly release them.
+    held_buttons: u8,
 }
 
 fn errno() -> i32 {
@@ -56,7 +60,7 @@ fn err_str() -> String {
 
 impl Ch9329 {
     pub fn new(path: String, baud: u32) -> Self {
-        Self { path, baud, file: None }
+        Self { path, baud, file: None, held_buttons: 0 }
     }
 
     fn fd(&self) -> Option<i32> {
@@ -238,16 +242,65 @@ impl Ch9329 {
 
     /// One relative-mouse frame (CMD 0x05): [0x01][buttons][X][Y][wheel].
     /// CH9329 button bits: bit0=left bit1=right bit2=middle.
-    pub fn mouse_rel(&mut self, buttons: u8, x: i8, y: i8, wheel: i8) -> Result<(), String> {
-        let data = [0x01, buttons, x as u8, y as u8, wheel as u8];
+    /// `held_buttons` is always included, so pressing a button in one tool call
+    /// stays down through later move/scroll calls until explicitly released.
+    fn send_mouse_frame(&mut self, x: i8, y: i8, wheel: i8) -> Result<(), String> {
+        let data = [0x01, self.held_buttons, x as u8, y as u8, wheel as u8];
         self.send_cmd(0x05, &data).map(|_| ())
     }
 
-    /// Move only via absolute frame (CMD 0x04): [0x02][0][Xlo][Xhi][Ylo][Yhi][0].
-    /// Buttons/wheel are deliberately NOT sent here: they never reach the host
-    /// on this module (spec §13); use mouse_rel for those.
+    /// Send `buttons` as the new held set; on failure keep the previous state
+    /// (the target never received the frame, so the old state is still truth).
+    fn set_held_buttons(&mut self, buttons: u8) -> Result<(), String> {
+        let prev = self.held_buttons;
+        self.held_buttons = buttons;
+        if let Err(e) = self.send_mouse_frame(0, 0, 0) {
+            self.held_buttons = prev;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Relative pointer move, keeping any button held by an earlier call pressed.
+    pub fn mouse_move_rel(&mut self, x: i8, y: i8) -> Result<(), String> {
+        self.send_mouse_frame(x, y, 0)
+    }
+
+    /// Wheel scroll, keeping any button held by an earlier call pressed.
+    pub fn mouse_scroll_rel(&mut self, wheel: i8) -> Result<(), String> {
+        self.send_mouse_frame(0, 0, wheel)
+    }
+
+    /// Press `buttons` (bitmask) and KEEP them pressed across later calls.
+    pub fn mouse_press(&mut self, buttons: u8) -> Result<(), String> {
+        let next = self.held_buttons | buttons;
+        self.set_held_buttons(next)
+    }
+
+    /// Release `buttons` (bitmask); any other held buttons stay down.
+    pub fn mouse_release(&mut self, buttons: u8) -> Result<(), String> {
+        let next = self.held_buttons & !buttons;
+        self.set_held_buttons(next)
+    }
+
+    /// Release every held button (also clears residual state from a previous
+    /// server process; safe no-op when nothing is held).
+    pub fn mouse_release_all(&mut self) -> Result<(), String> {
+        self.set_held_buttons(0)
+    }
+
+    /// Current held-button bitmask (for status output / diagnostics).
+    pub fn held_buttons(&self) -> u8 {
+        self.held_buttons
+    }
+
+    /// Move only via absolute frame (CMD 0x04): [0x02][buttons][Xlo][Xhi][Ylo][Yhi][0].
+    /// On this module the button byte never reaches the host (spec §13); it only
+    /// mirrors `held_buttons` so this frame cannot implicitly release a held
+    /// button on firmware that does track it. Use mouse_press/mouse_release for
+    /// button events. The wheel byte is unused by this command.
     pub fn mouse_abs_move(&mut self, x: u16, y: u16) -> Result<(), String> {
-        let data = [0x02, 0x00, (x & 0xFF) as u8, (x >> 8) as u8, (y & 0xFF) as u8, (y >> 8) as u8, 0x00];
+        let data = [0x02, self.held_buttons, (x & 0xFF) as u8, (x >> 8) as u8, (y & 0xFF) as u8, (y >> 8) as u8, 0x00];
         self.send_cmd(0x04, &data).map(|_| ())
     }
 
@@ -408,6 +461,16 @@ mod tests {
             let e = h.send_cmd(cmd, &[]).unwrap_err();
             assert!(e.contains("refused"), "cmd {cmd:02X} was not refused: {e}");
         }
+    }
+
+    #[test]
+    fn held_buttons_roll_back_when_send_fails() {
+        // No device: the frame is never delivered, so the state must stay unchanged.
+        let mut h = Ch9329::new("/nonexistent".into(), 9600);
+        assert!(h.mouse_press(0x01).is_err());
+        assert_eq!(h.held_buttons(), 0);
+        assert!(h.mouse_release_all().is_err());
+        assert_eq!(h.held_buttons(), 0);
     }
 
     #[test]
