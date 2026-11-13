@@ -48,6 +48,7 @@ ssh -F /home/debian/projects/usb-mcp/.ssh/config pi-mcp.lan
 - `capture_frame` の出力は YUYV 生取り込み → 可逆 PNG のみ。デバイス MJPEG を使う JPEG モードは不安定（先頭ヘッダ破損・ノーシグナル残像）のため **2026-11-08 に廃止**。経過・再現手順は `memo/20261107-usb-device-status.md`。
 - `capture_frame` にモード追加（2026-11-08）: `mode=diff`（前回キャプチャとの差分統計のみ、画像なし）/ `mode=both`、矩形クロップ `region={x,y,w,h}`、`diff_threshold`（既定12）。diff は YUYV バイト比較（`server/src/diff.rs`）、ベースラインはデバイス単位でメモリ内（サーバー再起動・解像度変更でリセット）。
 - マウス押下保持（2026-11-14）: `hid_mouse_click` の `action=press` でボタンを押したままにし、`action=release` または `hid_mouse_release` まで保持する。押下ビットは `Ch9329.held_buttons` が管理し、`hid_mouse_move` / `hid_mouse_scroll` の全フレームに含まれる（含めないと移動フレームが暗黙の解放になる）。サーバー起動時に 0 ボタンフレームを best-effort 送信して残留押下を掃除する。
+- Bearer 認証: `MCP_AUTH_TOKEN`（systemd では `EnvironmentFile=-/etc/usb-mcp/env`、0600）を設定すると `/mcp`（と互換用 `POST /`）に `Authorization: Bearer` が必須。未設定なら認証なし＋起動時警告。`OPTIONS` と `GET /` は対象外。`deploy.sh` は env ファイルを上書きしない。
 - ビルドは Pi Zero では不可能なため、VM 上の Docker で armv6l（musleabi 完全静的リンク）へクロスビルド → `server/deploy.sh` でデプロイ。
 
 ## 詳細メモへの参照

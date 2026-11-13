@@ -9,6 +9,7 @@
 //! not offered; GET /mcp returns 405 per spec). Session IDs are assigned on
 //! initialize and must be echoed in the Mcp-Session-Id header.
 
+mod auth;
 mod b64;
 mod capture;
 mod ch9329;
@@ -46,6 +47,7 @@ struct State {
     hid: Mutex<ch9329::Ch9329>,
     sessions: Mutex<HashSet<String>>,
     baselines: diff::Baselines,
+    auth: auth::BearerAuth,
 }
 
 fn main() {
@@ -54,12 +56,14 @@ fn main() {
     let video_dev = env("VIDEO_DEV", "/dev/video0");
     let serial_dev = env("SERIAL_DEV", "/dev/ttyUSB0");
     let baud: u32 = env("CH9329_BAUD", "9600").parse().unwrap_or(9600);
+    let auth = auth::BearerAuth::from_env();
 
     let state = Arc::new(State {
         video_dev: video_dev.clone(),
         hid: Mutex::new(ch9329::Ch9329::new(serial_dev.clone(), baud)),
         sessions: Mutex::new(HashSet::new()),
         baselines: diff::Baselines::new(),
+        auth,
     });
 
     // A previous server process may have died while a mouse button was held;
@@ -83,6 +87,11 @@ fn main() {
         "usb-mcp {} listening on http://{}/mcp  (video={}, serial={} @ {}baud)",
         env!("CARGO_PKG_VERSION"), bind, video_dev, serial_dev, baud
     );
+    if state.auth.enabled() {
+        println!("usb-mcp: bearer token authentication enabled for /mcp (MCP_AUTH_TOKEN)");
+    } else {
+        eprintln!("usb-mcp: WARNING: MCP_AUTH_TOKEN is unset — /mcp is unauthenticated");
+    }
 
     for request in server.incoming_requests() {
         let st = state.clone();
@@ -110,7 +119,7 @@ fn cors_headers() -> Vec<Header> {
         header("Access-Control-Allow-Origin", "*"),
         header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Last-Event-ID, Authorization"),
         header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"),
-        header("Access-Control-Expose-Headers", "Mcp-Session-Id"),
+        header("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate"),
     ]
 }
 
@@ -138,8 +147,46 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
         .map(|h| h.value.trim().to_string())
 }
 
+/// Consume an unread request body before responding early. Bounded so an
+/// unauthenticated client cannot force an unbounded read; bodies over the cap
+/// simply leave the connection unusable for keep-alive (tiny_http reports 400
+/// on the next parse and closes it).
+fn discard_body(req: &mut Request) {
+    let mut sink = std::io::sink();
+    let _ = std::io::copy(&mut req.as_reader().take(8 * 1024 * 1024), &mut sink);
+}
+
 fn handle_request(state: Arc<State>, mut req: Request) {
     let path = req.url().split('?').next().unwrap_or("").to_string();
+
+    // Bearer auth covers the MCP endpoint and the legacy POST / alias.
+    // OPTIONS (CORS preflight) and the GET / info page stay open. The check
+    // runs before the body is parsed so unauthorized calls never create
+    // sessions or touch the devices.
+    let protected = path == "/mcp" || (req.method() == &Method::Post && path == "/");
+    if req.method() != &Method::Options && protected {
+        let authorization = header_value(&req, "Authorization");
+        if !state.auth.authorize(authorization.as_deref()) {
+            let challenge = if authorization.is_some() {
+                r#"Bearer realm="usb-mcp", error="invalid_token""#
+            } else {
+                r#"Bearer realm="usb-mcp""#
+            };
+            // tiny_http does not drain unread bodies itself; leaving bytes in
+            // the stream would corrupt the next request on a keep-alive link.
+            discard_body(&mut req);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32000, "message": "unauthorized: a valid bearer token is required" }
+            })
+            .to_string();
+            let mut extra = vec![header("WWW-Authenticate", challenge)];
+            reply(req, 401, Some("application/json"), body, &mut extra);
+            return;
+        }
+    }
+
     match req.method() {
         Method::Get if path == "/" => {
             let body = format!(
