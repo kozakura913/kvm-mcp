@@ -7,6 +7,14 @@
 //!   (recovery requires physically unplugging the CH9329).
 //! - Buttons/wheel only take effect via relative-mouse frames (CMD 0x05);
 //!   absolute frames (CMD 0x04) are move-only (spec §13).
+//! - The tty is opened `O_NONBLOCK` and locked with `TIOCEXCL`, so a second
+//!   server/process cannot interleave frames on the same port.
+//! - Pending input is flushed before every command, and the port is closed on
+//!   an ACK timeout. A late ACK from a timed-out frame therefore cannot be
+//!   mistaken for the next command's ACK (ACKs carry only the command byte,
+//!   not a sequence number).
+//! - Writes have a 500 ms deadline; a wedged tty closes the port instead of
+//!   blocking the HID mutex forever.
 
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -14,6 +22,16 @@ use std::time::{Duration, Instant};
 
 /// Commands that must never be sent (see header comment).
 const FORBIDDEN: &[u8] = &[0x07, 0x0D, 0x0E];
+
+/// How long to wait for one ACK frame.
+const ACK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a single frame write may take before the port is closed.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// `poll(2)` timeout in whole milliseconds (never 0: that would spin).
+fn poll_timeout_ms(remain: Duration) -> i32 {
+    remain.as_millis().clamp(1, i32::MAX as u128) as i32
+}
 
 /// Wraparound sum of all bytes (HEAD..DATA), == the trailing SUM byte.
 pub fn checksum(bytes: &[u8]) -> u8 {
@@ -77,9 +95,20 @@ impl Ch9329 {
         }
         let cpath = CString::new(self.path.as_str())
             .map_err(|_| format!("invalid device path: {}", self.path))?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
         if fd < 0 {
-            return Err(format!("open {}: {}", self.path, err_str()));
+            let e = errno();
+            let hint = if e == libc::EBUSY {
+                " (another process holds the port; TIOCEXCL)"
+            } else {
+                ""
+            };
+            return Err(format!("open {}: {}{}", self.path, err_str(), hint));
         }
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
@@ -115,7 +144,17 @@ impl Ch9329 {
                 self.close_port();
                 return Err(format!("tcsetattr {}: {}", self.path, err_str()));
             }
-            libc::tcflush(fd, libc::TCIOFLUSH);
+            // One owner per tty: a second server/process gets EBUSY at open.
+            if libc::ioctl(fd, libc::TIOCEXCL) != 0 {
+                self.file = Some(file);
+                self.close_port();
+                return Err(format!("ioctl TIOCEXCL {}: {}", self.path, err_str()));
+            }
+            if libc::tcflush(fd, libc::TCIOFLUSH) != 0 {
+                self.file = Some(file);
+                self.close_port();
+                return Err(format!("tcflush {}: {}", self.path, err_str()));
+            }
         }
         self.file = Some(file);
         Ok(fd)
@@ -131,27 +170,18 @@ impl Ch9329 {
             ));
         }
         let fd = self.open_port()?;
-        let frame = build_frame(0x00, cmd, data);
 
-        let mut off = 0usize;
-        while off < frame.len() {
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    frame[off..].as_ptr() as *const libc::c_void,
-                    frame.len() - off,
-                )
-            };
-            if n < 0 {
-                let e = errno();
-                if e == libc::EINTR {
-                    continue;
-                }
-                self.close_port();
-                return Err(format!("write {}: {}", self.path, err_str()));
-            }
-            off += n as usize;
+        // ACKs only carry the command byte, not a sequence number. Flush any
+        // bytes left over from a previous command (e.g. a late ACK after a
+        // timeout) before writing the next frame so it cannot be mistaken for
+        // this command's ACK.
+        if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } != 0 {
+            self.close_port();
+            return Err(format!("tcflush {}: {}", self.path, err_str()));
         }
+
+        let frame = build_frame(0x00, cmd, data);
+        self.write_all(fd, &frame)?;
 
         match self.wait_frame(cmd | 0x80, cmd | 0xC0)? {
             Some(f) if (f.cmd & 0x40) == 0 => Ok(f.data), // normal ACK: CMD|0x80
@@ -160,11 +190,80 @@ impl Ch9329 {
                 let code = f.data.first().copied();
                 Err(format!("CH9329 rejected the frame: {}", status_desc(code)))
             }
-            None => Err(format!(
-                "no ACK within 500 ms on {} — check UART wiring, baud rate ({}) and CH9329 power",
-                self.path, self.baud
-            )),
+            None => {
+                // Forget the port: the next command must reopen (and flush)
+                // instead of consuming a stale ACK from this timed-out frame.
+                self.close_port();
+                Err(format!(
+                    "no ACK within {} ms on {} — check UART wiring, baud rate ({}) and CH9329 power",
+                    ACK_TIMEOUT.as_millis(),
+                    self.path,
+                    self.baud
+                ))
+            }
         }
+    }
+
+    /// Write all of `buf` within `WRITE_TIMEOUT`. The tty is non-blocking, so
+    /// a full UART buffer (or a vanished device) must not hold the HID mutex.
+    fn write_all(&mut self, fd: i32, buf: &[u8]) -> Result<(), String> {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut off = 0usize;
+        while off < buf.len() {
+            if Instant::now() >= deadline {
+                self.close_port();
+                return Err(format!(
+                    "write timeout after {} ms on {}",
+                    WRITE_TIMEOUT.as_millis(),
+                    self.path
+                ));
+            }
+            let remain = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(remain)) };
+            if rc < 0 {
+                let e = errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                self.close_port();
+                return Err(format!("poll(POLLOUT) {}: {}", self.path, err_str()));
+            }
+            if rc == 0 {
+                self.close_port();
+                return Err(format!(
+                    "write timeout after {} ms on {}",
+                    WRITE_TIMEOUT.as_millis(),
+                    self.path
+                ));
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                self.close_port();
+                return Err(format!("write {}: device error/hangup", self.path));
+            }
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    buf[off..].as_ptr() as *const libc::c_void,
+                    buf.len() - off,
+                )
+            };
+            if n < 0 {
+                let e = errno();
+                if e == libc::EINTR || e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    continue;
+                }
+                self.close_port();
+                return Err(format!("write {}: {}", self.path, err_str()));
+            }
+            if n == 0 {
+                // A non-blocking tty write returning 0 would otherwise spin.
+                self.close_port();
+                return Err(format!("write {}: returned 0 bytes", self.path));
+            }
+            off += n as usize;
+        }
+        Ok(())
     }
 
     fn wait_frame(&mut self, want_ok: u8, want_err: u8) -> Result<Option<RawFrame>, String> {
@@ -172,7 +271,7 @@ impl Ch9329 {
             Some(fd) => fd,
             None => return Ok(None),
         };
-        let deadline = Instant::now() + Duration::from_millis(500);
+        let deadline = Instant::now() + ACK_TIMEOUT;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 128];
         loop {
@@ -181,7 +280,7 @@ impl Ch9329 {
                 return Ok(None);
             }
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let rc = unsafe { libc::poll(&mut pfd, 1, remain.as_millis().min(1000) as i32) };
+            let rc = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(remain)) };
             if rc < 0 {
                 let e = errno();
                 if e == libc::EINTR {
@@ -193,6 +292,10 @@ impl Ch9329 {
             if rc == 0 {
                 return Ok(None);
             }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                self.close_port();
+                return Err(format!("read {}: device error/hangup", self.path));
+            }
             let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
             if n < 0 {
                 let e = errno();
@@ -203,7 +306,10 @@ impl Ch9329 {
                 return Err(format!("read {}: {}", self.path, err_str()));
             }
             if n == 0 {
-                continue;
+                // With VMIN=0/VTIME=0 a zero-length read only happens on EOF;
+                // continuing would spin until the deadline.
+                self.close_port();
+                return Err(format!("read {}: unexpected EOF", self.path));
             }
             buf.extend_from_slice(&chunk[..n as usize]);
             while let Some(f) = extract_frame(&mut buf) {
@@ -492,5 +598,196 @@ mod tests {
         assert_eq!(f.cmd, 0xC2);
         assert_eq!(f.data, vec![0xE4]);
         assert!(buf.is_empty());
+    }
+}
+
+/// Real-tty tests using a Linux pseudo-terminal. The master side plays the
+/// CH9329; the slave side is opened by `Ch9329` exactly like /dev/ttyUSB0.
+/// They are skipped when the environment cannot allocate a pty.
+#[cfg(all(test, target_os = "linux"))]
+mod pty_tests {
+    use super::*;
+    use std::os::unix::io::RawFd;
+    use std::thread;
+    use std::time::Instant;
+
+    struct Pty {
+        master: RawFd,
+        slave_path: String,
+    }
+
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.master);
+            }
+        }
+    }
+
+    fn open_pty() -> Option<Pty> {
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+            if master < 0 {
+                return None;
+            }
+            if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
+                libc::close(master);
+                return None;
+            }
+            let mut buf = [0 as std::os::raw::c_char; 128];
+            if libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) != 0 {
+                libc::close(master);
+                return None;
+            }
+            let path = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+            Some(Pty { master, slave_path: path })
+        }
+    }
+
+    fn read_exact_fd(fd: RawFd, buf: &mut [u8]) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut off = 0usize;
+        while off < buf.len() {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                panic!("timed out reading from pty");
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(remain)) };
+            if rc < 0 {
+                panic!("poll: {}", err_str());
+            }
+            if rc == 0 {
+                panic!("timed out reading from pty");
+            }
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    buf[off..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - off,
+                )
+            };
+            if n < 0 {
+                let e = errno();
+                if e == libc::EINTR || e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    continue;
+                }
+                panic!("read: {}", err_str());
+            }
+            if n == 0 {
+                panic!("pty EOF");
+            }
+            off += n as usize;
+        }
+    }
+
+    fn write_fd(fd: RawFd, buf: &[u8]) {
+        let mut off = 0usize;
+        while off < buf.len() {
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    buf[off..].as_ptr() as *const libc::c_void,
+                    buf.len() - off,
+                )
+            };
+            if n < 0 {
+                let e = errno();
+                if e == libc::EINTR || e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    continue;
+                }
+                panic!("write: {}", err_str());
+            }
+            if n == 0 {
+                panic!("write returned 0");
+            }
+            off += n as usize;
+        }
+    }
+
+    #[test]
+    fn flushes_a_stale_ack_before_the_next_command() {
+        let Some(pty) = open_pty() else {
+            eprintln!("pty unavailable; skipping");
+            return;
+        };
+        let master = pty.master;
+        let responder = thread::spawn(move || {
+            for i in 0..2 {
+                let mut cmd = [0u8; 6];
+                read_exact_fd(master, &mut cmd);
+                assert_eq!(
+                    &cmd[..4],
+                    &[0x57, 0xAB, 0x00, 0x01],
+                    "unexpected command frame {cmd:02X?}"
+                );
+                let data: [u8; 3] = if i == 0 {
+                    [0x34, 0x01, 0x00]
+                } else {
+                    [0x35, 0x00, 0x00]
+                };
+                write_fd(master, &build_frame(0x00, 0x81, &data));
+            }
+        });
+
+        let mut h = Ch9329::new(pty.slave_path.clone(), 9600);
+        let first = h.get_info().expect("first GET_INFO");
+        assert_eq!(first.version, 0x34);
+
+        // Simulate a late ACK from a command that timed out: it is already in
+        // the tty input queue when the next command is sent.
+        write_fd(pty.master, &build_frame(0x00, 0x81, &[0x99, 0x00, 0x00]));
+
+        let second = h.get_info().expect("second GET_INFO");
+        assert_eq!(second.version, 0x35, "stale ACK was not flushed");
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn ack_timeout_closes_the_port() {
+        let Some(pty) = open_pty() else {
+            return;
+        };
+        let mut h = Ch9329::new(pty.slave_path.clone(), 9600);
+        let start = Instant::now();
+        let err = match h.get_info() {
+            Ok(_) => panic!("GET_INFO unexpectedly succeeded without a responder"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no ACK"), "unexpected error: {err}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(450),
+            "returned before the ACK timeout: {:?}",
+            start.elapsed()
+        );
+        assert!(h.file.is_none(), "port must be closed after an ACK timeout");
+    }
+
+    #[test]
+    fn open_port_takes_an_exclusive_lock() {
+        let Some(pty) = open_pty() else {
+            return;
+        };
+        let mut h = Ch9329::new(pty.slave_path.clone(), 9600);
+        h.open_port().expect("open pty slave");
+
+        let cpath = CString::new(pty.slave_path.clone()).unwrap();
+        let second = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+            )
+        };
+        assert!(
+            second < 0,
+            "second open succeeded; TIOCEXCL is not effective"
+        );
+        assert_eq!(
+            errno(),
+            libc::EBUSY,
+            "expected EBUSY from a TIOCEXCL'd tty, got {}",
+            err_str()
+        );
+        h.close_port();
     }
 }
