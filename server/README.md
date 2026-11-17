@@ -44,9 +44,10 @@ MCP クライアント設定（OpenCode の例、`opencode.json`）:
 
 ## 認証（Bearer トークン）
 
-`MCP_AUTH_TOKEN` を設定すると、`POST/GET/DELETE /mcp`（と互換用の `POST /`）に
+`MCP_AUTH_TOKEN` を設定すると、`POST/GET/DELETE /mcp`（と互換用の `POST /`、最後に撮った画面を返す `GET /frame.png`）に
 `Authorization: Bearer <token>` が必須になる。`OPTIONS`（CORS preflight）と
-`GET /` の情報ページは認証不要。
+`GET /` の情報ページは認証不要。`/frame.png` だけはブラウザがヘッダを付けられないため、
+同じトークンを `?token=<token>` クエリでも受け付ける（比較はやはり定数時間）。
 
 - 未設定または空: 認証なしで動作し、起動時に journal へ警告を出す（後方互換）
 - トークン不一致・ヘッダ欠落: `401` + `WWW-Authenticate: Bearer realm="usb-mcp"`
@@ -90,6 +91,24 @@ curl -i -X POST http://pi-mcp.lan:8765/mcp \
 
 > 平文 HTTP ではトークンが LAN 上をそのまま流れる。信頼できないネットワークでは
 > 上記の SSH ポートフォワードか TLS リバースプロキシを使うこと。
+
+## 最後に撮った画像をブラウザで見る（GET /frame.png）
+
+`capture_frame` は画像をエンコードするたびに（`mode=image` / `both`）、その PNG を
+サーバーのメモリに保持する。`GET /frame.png`（port 8765）はそのバイト列をそのまま
+返すので、新しい撮影をトリガーせずにブラウザで最後の画面が見られる。
+
+```
+http://pi-mcp.lan:8765/frame.png            ← 認証なし運用時
+http://pi-mcp.lan:8765/frame.png?token=<TOKEN>   ← MCP_AUTH_TOKEN 設定時
+```
+
+- `mode=diff` は PNG を生成しないため、保持画像は**上書きされない**（=「最後に生成されたPNG」）
+- レスポンスヘッダ: `Content-Type: image/png`、`Cache-Control: no-store`、
+  `X-Frame-Size` / `X-Capture-Device` / `X-Captured-Unix`（撮影メタ情報）
+- まだ一度も画像撮影していない（サーバー起動直後など）と `404`
+- メモリのみ。サーバー再起動で消える。解像度違いや `region` クロップの撮影でも
+  「最後に生成されたPNG」としてそのまま差し替わる
 
 ## ツール一覧（12個）
 
@@ -167,7 +186,8 @@ BUILD_DOCKER_ARGS='-e CARGO_HTTP_CAINFO=/run/ccserver-ca.pem -e SSL_CERT_FILE=/r
   の単一応答**（SSE 配信はしないので `GET /mcp` は spec 通り 405 を返す）
 - `initialize` で `Mcp-Session-Id` を発行（以後の要求は必須、不明はエラー）。
   `DELETE /mcp` でセッション破棄。CORS はすべて許可
-- `MCP_AUTH_TOKEN` 設定時は `/mcp` に `Authorization: Bearer` を要求。未認証は
+- `MCP_AUTH_TOKEN` 設定時は `/mcp` に `Authorization: Bearer` を要求（`/frame.png` も対象。
+  ここは `?token=` クエリでも可）。未認証は
   `401` + `WWW-Authenticate`（`OPTIONS` と `GET /` は対象外）
 - protocolVersion は 2025-06-18 / 2025-03-26 / 2024-11-05 / 2024-10-07 に対応
 

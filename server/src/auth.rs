@@ -43,9 +43,16 @@ impl BearerAuth {
     /// True when the request may proceed: authentication is disabled, or the
     /// `Authorization` header carries the configured bearer token.
     pub fn authorize(&self, authorization: Option<&str>) -> bool {
+        self.authorize_credential(bearer_credential(authorization))
+    }
+
+    /// Same decision on an already-extracted raw credential (e.g. a `?token=`
+    /// query parameter on the browser-viewable PNG endpoint — browsers
+    /// cannot attach a header to an inline image). Still constant-time.
+    pub fn authorize_credential(&self, credential: Option<&str>) -> bool {
         match &self.token {
             None => true,
-            Some(expected) => match bearer_credential(authorization) {
+            Some(expected) => match credential {
                 Some(presented) => ct_eq(presented.as_bytes(), expected.as_bytes()),
                 None => false,
             },
@@ -138,6 +145,17 @@ mod tests {
     #[test]
     fn enabled_auth_reports_enabled() {
         assert!(auth("s3cret-token").enabled());
+    }
+
+    #[test]
+    fn raw_credential_rule_matches_bearer_rule() {
+        let a = auth("s3cret-token");
+        assert!(a.authorize_credential(Some("s3cret-token")));
+        assert!(!a.authorize_credential(Some("s3cret-tokeN")));
+        assert!(!a.authorize_credential(Some("")));
+        assert!(!a.authorize_credential(None));
+        // disabled auth accepts even a bad raw credential (nothing to match)
+        assert!(BearerAuth::new(None).authorize_credential(Some("whatever")));
     }
 
     #[test]

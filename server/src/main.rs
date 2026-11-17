@@ -8,6 +8,10 @@
 //! single application/json responses (SSE streams are optional per spec and
 //! not offered; GET /mcp returns 405 per spec). Session IDs are assigned on
 //! initialize and must be echoed in the Mcp-Session-Id header.
+//!
+//! Beyond the MCP surface, GET /frame.png serves the last PNG that
+//! capture_frame encoded (kept in memory) so a plain browser can show the
+//! current view without triggering a new grab.
 
 mod auth;
 mod b64;
@@ -47,16 +51,32 @@ hid_key_press action=press works the same way for the keyboard: keys and modifie
 tool calls until action=release on the same keys or hid_release_keys, and later hid_key_press clicks \
 and hid_type_text characters are composed on top of the held keys (six-key HID limit). \
 Absolute mouse positioning is unreliable on the target — use hid_mouse_move (relative) plus \
-captures to steer. Proving keyboard injection works: type 'echo <marker>' + Enter into a terminal \
-on the target and check the capture shows the result. Never worry about bricking the CH9329: \
-this server refuses the dangerous hidden commands by design.";
+captures to steer. capture_frame also keeps its last encoded PNG in server memory: open \
+GET /frame.png (same port) in a browser to view it without a new grab — with bearer auth \
+on, use ?token=<token>. Proving keyboard injection works: type 'echo <marker>' + Enter into \
+a terminal on the target and check the capture shows the result. Never worry about bricking \
+the CH9329: this server refuses the dangerous hidden commands by design.";
 
 struct State {
     video_dev: String,
     hid: Mutex<ch9329::Ch9329>,
     sessions: Mutex<HashSet<String>>,
     baselines: diff::Baselines,
+    last_png: Mutex<Option<SavedPng>>,
     auth: auth::BearerAuth,
+}
+
+/// The most recent PNG that capture_frame encoded (image/both modes). Kept in
+/// memory only — a full 1280x720 lossless PNG is a few hundred KB, trivial on
+/// the Pi — and served verbatim by `GET /frame.png` so the last view can be
+/// inspected in a plain browser without triggering a new grab. mode=diff
+/// grabs do NOT touch this (nothing was encoded), mirroring "last generated".
+struct SavedPng {
+    data: Vec<u8>,
+    w: u32,
+    h: u32,
+    dev: String,
+    captured_at: u64, // unix seconds (server clock)
 }
 
 fn main() {
@@ -72,6 +92,7 @@ fn main() {
         hid: Mutex::new(ch9329::Ch9329::new(serial_dev.clone(), baud)),
         sessions: Mutex::new(HashSet::new()),
         baselines: diff::Baselines::new(),
+        last_png: Mutex::new(None),
         auth,
     });
 
@@ -323,6 +344,25 @@ fn header_value(req: &Request, name: &str) -> Option<String> {
         .map(|h| h.value.trim().to_string())
 }
 
+/// Fetch one query parameter from a raw request URL. No percent-decoding:
+/// the tokens in use are hex (`openssl rand -hex`) and the paths here are
+/// simple ASCII; hand-encoded escapes are intentionally NOT decoded.
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.splitn(2, '?').nth(1)?;
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_string())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Consume an unread request body before responding early. Bounded so an
 /// unauthenticated client cannot force an unbounded read; bodies over the cap
 /// simply leave the connection unusable for keep-alive (tiny_http reports 400
@@ -333,17 +373,25 @@ fn discard_body(req: &mut Request) {
 }
 
 fn handle_request(state: Arc<State>, mut req: Request) {
-    let path = req.url().split('?').next().unwrap_or("").to_string();
+    let url = req.url().to_string();
+    let path = url.split('?').next().unwrap_or("").to_string();
 
-    // Bearer auth covers the MCP endpoint and the legacy POST / alias.
-    // OPTIONS (CORS preflight) and the GET / info page stay open. The check
-    // runs before the body is parsed so unauthorized calls never create
-    // sessions or touch the devices.
-    let protected = path == "/mcp" || (req.method() == &Method::Post && path == "/");
+    // Bearer auth covers the MCP endpoint, the legacy POST / alias, and the
+    // PNG view endpoint (a screenshot of the target is just as sensitive as
+    // the tools themselves). /frame.png additionally accepts the token as a
+    // ?token= query parameter because a browser cannot attach a header to an
+    // inline image. OPTIONS (CORS preflight) and the GET / info page stay
+    // open. The check runs before the body is parsed so unauthorized calls
+    // never create sessions or touch the devices.
+    let frame_get = req.method() == &Method::Get && path == "/frame.png";
+    let protected = path == "/mcp" || (req.method() == &Method::Post && path == "/") || frame_get;
     if req.method() != &Method::Options && protected {
         let authorization = header_value(&req, "Authorization");
-        if !state.auth.authorize(authorization.as_deref()) {
-            let challenge = if authorization.is_some() {
+        let query_token = if frame_get { query_param(&url, "token") } else { None };
+        let authorized = state.auth.authorize(authorization.as_deref())
+            || state.auth.authorize_credential(query_token.as_deref());
+        if !authorized {
+            let challenge = if authorization.is_some() || query_token.is_some() {
                 r#"Bearer realm="usb-mcp", error="invalid_token""#
             } else {
                 r#"Bearer realm="usb-mcp""#
@@ -351,10 +399,15 @@ fn handle_request(state: Arc<State>, mut req: Request) {
             // tiny_http does not drain unread bodies itself; leaving bytes in
             // the stream would corrupt the next request on a keep-alive link.
             discard_body(&mut req);
+            let message = if frame_get {
+                "unauthorized: a valid bearer token is required (Authorization header or ?token= query)"
+            } else {
+                "unauthorized: a valid bearer token is required"
+            };
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "error": { "code": -32000, "message": "unauthorized: a valid bearer token is required" }
+                "error": { "code": -32000, "message": message }
             })
             .to_string();
             let mut extra = vec![header("WWW-Authenticate", challenge)];
@@ -366,11 +419,47 @@ fn handle_request(state: Arc<State>, mut req: Request) {
     match req.method() {
         Method::Get if path == "/" => {
             let body = format!(
-                "usb-mcp {} — Streamable HTTP MCP endpoint: POST JSON-RPC to /mcp\nvideo: {}\n",
+                "usb-mcp {} — Streamable HTTP MCP endpoint: POST JSON-RPC to /mcp\nlast capture: GET /frame.png (PNG kept in memory; ?token=<bearer> when auth is on)\nvideo: {}\n",
                 env!("CARGO_PKG_VERSION"),
                 state.video_dev
             );
             reply(req, 200, Some("text/plain; charset=utf-8"), body, &mut vec![]);
+        }
+        Method::Get if path == "/frame.png" => {
+            // Serve the capture_frame PNG last generated, byte for byte —
+            // browser-viewable without triggering a new grab.
+            let last = state.last_png.lock().unwrap_or_else(|e| e.into_inner());
+            match last.as_ref() {
+                Some(p) => {
+                    let size = format!("{}x{}", p.w, p.h);
+                    let when = p.captured_at.to_string();
+                    let mut headers = cors_headers();
+                    headers.extend([
+                        header("Content-Type", "image/png"),
+                        header("Cache-Control", "no-store"),
+                        header("X-Frame-Size", &size),
+                        header("X-Capture-Device", &p.dev),
+                        header("X-Captured-Unix", &when),
+                    ]);
+                    let body = p.data.clone();
+                    let len = body.len();
+                    let resp = Response::new(
+                        tiny_http::StatusCode(200),
+                        headers,
+                        std::io::Cursor::new(body),
+                        Some(len),
+                        None,
+                    );
+                    let _ = req.respond(resp);
+                }
+                None => reply(
+                    req,
+                    404,
+                    Some("text/plain; charset=utf-8"),
+                    "no PNG in memory yet — run capture_frame (mode image/both) first".into(),
+                    &mut vec![],
+                ),
+            }
         }
         Method::Get if path == "/mcp" => {
             // Streamable HTTP: no server-initiated SSE stream offered → 405 per spec.
@@ -572,7 +661,7 @@ fn tool_defs() -> Value {
       },
       {
         "name": "capture_frame",
-        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI) from raw YUYV (always warmup-discarded first). mode=image (default): lossless compressed PNG image block (a few hundred KB), best for pixel-diff/text legibility. mode=diff: compares the grab with the PREVIOUS capture on the same device and returns ONLY text change stats (changed % + bounding box in frame px, no image) — a cheap 'did the screen move?' check between HID actions. mode=both: stats + PNG. Every capture stores its full frame as the new baseline (in-memory; resets on restart or dimension change). Optional region {x,y,w,h} crops the PNG to that rect and scopes diff stats to it. NOTE: the device MJPEG path was removed 2026-11-08 (unstable headers / stale no-signal frames); PNG remains the only image output.",
+        "description": "Grab ONE frame from the UVC capture (the target PC's HDMI) from raw YUYV (always warmup-discarded first). mode=image (default): lossless compressed PNG image block (a few hundred KB), best for pixel-diff/text legibility. mode=diff: compares the grab with the PREVIOUS capture on the same device and returns ONLY text change stats (changed % + bounding box in frame px, no image) — a cheap 'did the screen move?' check between HID actions. mode=both: stats + PNG. Every capture stores its full frame as the new baseline (in-memory; resets on restart or dimension change). Every PNG this tool encodes is also kept as the server's last frame and served byte-for-byte by GET /frame.png (same port; ?token=<bearer> when auth is on) for browser viewing without a new grab. Optional region {x,y,w,h} crops the PNG to that rect and scopes diff stats to it. NOTE: the device MJPEG path was removed 2026-11-08 (unstable headers / stale no-signal frames); PNG remains the only image output.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -849,11 +938,11 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             };
             let head = match &png_data {
                 Some(png_data) => format!(
-                    "captured {}x{} lossless PNG (from raw YUYV){}{}, {} bytes from {}",
+                    "captured {}x{} lossless PNG (from raw YUYV){}{}, {} bytes from {} — kept in memory, browser-viewable at GET /frame.png",
                     cw, ch, adj, region_desc, png_data.len(), dev
                 ),
                 None => format!(
-                    "captured {}x{} raw YUYV{} (diff-only mode, no image sent) from {}",
+                    "captured {}x{} raw YUYV{} (diff-only mode, no image sent; the last PNG in memory is unchanged) from {}",
                     fr.w, fr.h, adj, dev
                 ),
             };
@@ -862,8 +951,12 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
                 None => head,
             };
             let mut blocks = vec![text_block(text)];
-            if let Some(png_data) = png_data {
-                blocks.push(json!({ "type": "image", "data": b64::encode(&png_data), "mimeType": "image/png" }));
+            if let Some(data) = png_data {
+                blocks.push(json!({ "type": "image", "data": b64::encode(&data), "mimeType": "image/png" }));
+                // the encoded PNG itself now lives in memory for GET /frame.png
+                // (moved in, no copy; diff-only grabs never overwrite it)
+                let mut last = state.last_png.lock().unwrap_or_else(|e| e.into_inner());
+                *last = Some(SavedPng { data, w: cw, h: ch, dev, captured_at: now_unix() });
             }
             Ok(blocks)
         }
@@ -1193,8 +1286,25 @@ mod tests {
             hid: Mutex::new(ch9329::Ch9329::new(serial.into(), 9600)),
             sessions: Mutex::new(HashSet::new()),
             baselines: diff::Baselines::new(),
+            last_png: Mutex::new(None),
             auth: auth::BearerAuth::from_env(),
         }
+    }
+
+    #[test]
+    fn query_param_extracts_from_raw_url() {
+        assert_eq!(query_param("/frame.png?token=abc123", "token").as_deref(), Some("abc123"));
+        assert_eq!(query_param("/frame.png?a=1&token=abc&b=2", "token").as_deref(), Some("abc"));
+        assert_eq!(query_param("/frame.png", "token"), None);
+        assert_eq!(query_param("/frame.png?other=1", "token"), None);
+        assert_eq!(query_param("/frame.png?token=", "token").as_deref(), Some(""));
+        assert_eq!(query_param("/frame.png?token", "token"), None); // no '=' → not a pair
+    }
+
+    #[test]
+    fn last_png_starts_empty() {
+        let state = test_state("/nonexistent-usb-mcp-test");
+        assert!(state.last_png.lock().unwrap().is_none());
     }
 
     #[test]
