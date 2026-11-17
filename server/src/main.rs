@@ -43,6 +43,9 @@ verify loop) and region {x,y,w,h} (crop a rect, e.g. to read one area at full de
 hid_mouse_click action=press holds a mouse button DOWN across tool calls (moves/scrolled frames keep \
 it pressed) until action=release on the same button or hid_mouse_release; plain click still \
 presses+releases within the call. \
+hid_key_press action=press works the same way for the keyboard: keys and modifiers stay held across \
+tool calls until action=release on the same keys or hid_release_keys, and later hid_key_press clicks \
+and hid_type_text characters are composed on top of the held keys (six-key HID limit). \
 Absolute mouse positioning is unreliable on the target — use hid_mouse_move (relative) plus \
 captures to steer. Proving keyboard injection works: type 'echo <marker>' + Enter into a terminal \
 on the target and check the capture shows the result. Never worry about bricking the CH9329: \
@@ -130,7 +133,7 @@ fn cleanup_hid(state: &State, reason: &str) {
         }
     };
     let mut errors = Vec::new();
-    if let Err(e) = hid.release_all_keys() {
+    if let Err(e) = hid.key_release_all() {
         errors.push(format!("keyboard: {}", e));
     }
     if let Err(e) = hid.mouse_release_all() {
@@ -585,25 +588,26 @@ fn tool_defs() -> Value {
       },
       {
         "name": "hid_status",
-        "description": "CH9329 GET_INFO: firmware version + whether the TARGET PC currently enumerates the injected HID device (usb_status=0x01). First call in any session to check the link.",
+        "description": "CH9329 GET_INFO: firmware version + whether the TARGET PC currently enumerates the injected HID device (usb_status=0x01). First call in any session to check the link. Also lists mouse buttons and keyboard keys currently held via action=press.",
         "inputSchema": { "type": "object", "properties": {} }
       },
       {
         "name": "hid_key_press",
-        "description": "Press a key combination, hold it, then release ALL keys. Names: a-z 0-9 symbols, Enter Esc Tab Space Backspace Delete Insert Home End PgUp PgDn Up Down Left Right F1-F12 CapsLock NumLock App, kp_*, or raw '0xNN' usage ids. Modifiers: ctrl shift alt win (+ r- variants).",
+        "description": "Keyboard action on the target. Names: a-z 0-9 symbols, Enter Esc Tab Space Backspace Delete Insert Home End PgUp PgDn Up Down Left Right F1-F12 CapsLock NumLock App, kp_*, or raw '0xNN' usage ids. Modifiers: ctrl shift alt win (+ r- variants). action=click (default): press the combo ON TOP of any keys currently held, hold hold_ms, then restore the held state. action=press: hold these keys/modifiers DOWN across tool calls (held modifiers, sticky keys, key long-press) until action=release on the same keys or hid_release_keys. action=release: lift those keys/modifiers (usages match regardless of shift; other held keys stay down). While keys are held, later clicks and hid_type_text characters compose on top of them (max 6 simultaneous keys total).",
         "inputSchema": {
           "type": "object",
           "properties": {
-            "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "keys to press simultaneously (max 6)" },
+            "keys": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "keys to press/release simultaneously (max 6)" },
             "modifiers": { "type": "array", "items": { "type": "string" }, "default": [] },
-            "hold_ms": { "type": "integer", "default": 100, "minimum": 10, "maximum": 5000 }
+            "action": { "type": "string", "enum": ["click", "press", "release"], "default": "click", "description": "click: press+restore here; press: hold down across calls; release: lift these keys/modifiers" },
+            "hold_ms": { "type": "integer", "default": 100, "minimum": 10, "maximum": 5000, "description": "press duration for action=click" }
           },
           "required": ["keys"]
         }
       },
       {
         "name": "hid_type_text",
-        "description": "Type a string into the target PC's focused window (US layout ASCII; shift handled automatically; \\n = Enter).",
+        "description": "Type a string into the target PC's focused window (US layout ASCII; shift handled automatically; \\n = Enter). While keys/modifiers are held (hid_key_press action=press), each character is composed on top of them and the held state is restored between characters.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -616,7 +620,7 @@ fn tool_defs() -> Value {
       },
       {
         "name": "hid_release_keys",
-        "description": "Send the all-keys-release keyboard report (clears stuck keys — safe no-op otherwise).",
+        "description": "Send the all-keys-release keyboard report (clears stuck keys — safe no-op otherwise). Also clears the server's held-key state, like hid_mouse_release does for buttons.",
         "inputSchema": { "type": "object", "properties": {} }
       },
       {
@@ -876,12 +880,20 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
                     keys::mouse_buttons_desc(hid.held_buttons())
                 ));
             }
+            let (kmods, kkeys) = hid.kb_state();
+            if kmods != 0 || !kkeys.is_empty() {
+                s.push_str(&format!(
+                    "\nkeyboard keys currently HELD: {} (release with hid_key_press action=release or hid_release_keys)",
+                    kb_held_desc(kmods, &kkeys)
+                ));
+            }
             Ok(vec![text_block(s)])
         }
         "hid_key_press" => {
             let keys_v = args.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
             let mods_v = args.get("modifiers").and_then(Value::as_array).cloned().unwrap_or_default();
             let hold = int_arg(args, "hold_ms", 100)?.clamp(10, 5000) as u64;
+            let action = str_arg(args, "action", "click");
             let mut modifiers: u8 = 0;
             for m in &mods_v {
                 let m = m.as_str().ok_or("modifiers must be strings")?;
@@ -890,31 +902,70 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
             if keys_v.len() > 6 {
                 return Err("USB HID keyboards report at most 6 simultaneous keys".into());
             }
-            let mut usages: Vec<u8> = Vec::new();
-            let mut shift = modifiers;
+            let mut pressed: Vec<ch9329::HeldKey> = Vec::new();
             for k in &keys_v {
                 let k = k.as_str().ok_or("keys must be strings")?;
                 let ki = keys::key_name(k).ok_or_else(|| format!("unknown key name: {}", k))?;
-                usages.push(ki.usage);
-                if ki.shift {
-                    shift |= 0x02;
-                }
+                pressed.push(ch9329::HeldKey { usage: ki.usage, shift: ki.shift });
             }
-            if usages.is_empty() && mods_v.is_empty() {
+            if pressed.is_empty() && mods_v.is_empty() {
                 return Err("give at least one key or modifier".into());
             }
+            let names = keys_v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("+");
             let mut hid = lock_hid(state);
-            hid.kb_report(shift, &usages)?;
-            sleep_ms(hold);
-            if let Err(e) = hid.release_all_keys() {
-                return Err(format!("press succeeded but RELEASE failed — keys may be stuck: {} (call hid_release_keys)", e));
+            match action {
+                "press" => {
+                    hid.key_press(modifiers, &pressed)?;
+                    let (hm, hk) = hid.kb_state();
+                    Ok(vec![text_block(format!(
+                        "keys=[{}] mods={:#010b} pressed and HELD across calls (currently held: {}) — release with hid_key_press action=release or hid_release_keys",
+                        names,
+                        modifiers,
+                        kb_held_desc(hm, &hk)
+                    ))])
+                }
+                "release" => {
+                    let usages: Vec<u8> = pressed.iter().map(|k| k.usage).collect();
+                    hid.key_release(modifiers, &usages)?;
+                    let (hm, hk) = hid.kb_state();
+                    Ok(vec![text_block(format!(
+                        "keys=[{}] mods={:#010b} released (currently held: {})",
+                        names,
+                        modifiers,
+                        kb_held_desc(hm, &hk)
+                    ))])
+                }
+                "click" => {
+                    // Compose the combo ON TOP of whatever is currently held,
+                    // then restore the held state. The tracking fields are not
+                    // touched: a click never changes what stays held.
+                    let (base_mods, base_keys) = hid.kb_state();
+                    let composed = ch9329::merge_held_keys(&base_keys, &pressed)?;
+                    let (cm, cu) = ch9329::Ch9329::kb_frame(base_mods | modifiers, &composed);
+                    hid.kb_report(cm, &cu)?;
+                    sleep_ms(hold);
+                    let (rm, ru) = ch9329::Ch9329::kb_frame(base_mods, &base_keys);
+                    if let Err(e) = hid.kb_report(rm, &ru) {
+                        return Err(format!("press succeeded but RELEASE failed — keys may be stuck: {} (call hid_release_keys)", e));
+                    }
+                    let holding = if base_mods != 0 || !base_keys.is_empty() {
+                        format!(" [still holding {}]", kb_held_desc(base_mods, &base_keys))
+                    } else {
+                        String::new()
+                    };
+                    Ok(vec![text_block(format!(
+                        "keys=[{}] mods={:#010b} held {}ms{}",
+                        names,
+                        cm,
+                        hold,
+                        holding
+                    ))])
+                }
+                other => Err(format!(
+                    "action '{}' is invalid: use click (default), press (hold across calls) or release",
+                    other
+                )),
             }
-            Ok(vec![text_block(format!(
-                "keys=[{}] mods={:#010b} held {}ms",
-                keys_v.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("+"),
-                shift,
-                hold
-            ))])
         }
         "hid_type_text" => {
             let text = args.get("text").and_then(Value::as_str).ok_or("text is required")?;
@@ -941,29 +992,49 @@ fn call_tool(state: &Arc<State>, name: &str, args: &Value) -> Result<Vec<Value>,
                 out
             };
             let mut hid = lock_hid(state);
+            // Compose with any keys held via action=press: each character
+            // rides on top of the held state, and the RESTORE frame between
+            // characters returns to the held state instead of all-zeros.
+            let (base_mods, base_keys) = hid.kb_state();
+            if base_keys.len() >= 6 {
+                return Err(
+                    "cannot type while 6 keys are held — release some first (hid_release_keys)"
+                        .into(),
+                );
+            }
+            let (rm, ru) = ch9329::Ch9329::kb_frame(base_mods, &base_keys);
             let mut fails = 0usize;
             for (i, (usage, sh)) in chars.iter().enumerate() {
-                let mods = if *sh { 0x02 } else { 0x00 };
-                if let Err(e) = hid.kb_report(mods, &[*usage]) {
+                let composed = ch9329::merge_held_keys(
+                    &base_keys,
+                    &[ch9329::HeldKey { usage: *usage, shift: *sh }],
+                )?;
+                let (cm, cu) = ch9329::Ch9329::kb_frame(base_mods, &composed);
+                if let Err(e) = hid.kb_report(cm, &cu) {
                     fails += 1;
                     // try to recover for the rest of the string
-                    let _ = hid.release_all_keys();
+                    let _ = hid.kb_report(rm, &ru);
                     if fails == 1 {
                         eprintln!("usb-mcp: type_text char {} failed: {}", i, e);
                     }
                 }
                 sleep_ms(hold);
-                hid.release_all_keys().ok();
+                hid.kb_report(rm, &ru).ok();
                 sleep_ms(gap);
             }
             if fails > 0 {
                 return Err(format!("typed {} of {} chars ({} failures) — check wiring/status", chars.len() - fails, chars.len(), fails));
             }
-            Ok(vec![text_block(format!("typed {} chars", chars.len()))])
+            let composed_note = if base_mods != 0 || !base_keys.is_empty() {
+                format!(" (composing with held: {})", kb_held_desc(base_mods, &base_keys))
+            } else {
+                String::new()
+            };
+            Ok(vec![text_block(format!("typed {} chars{}", chars.len(), composed_note))])
         }
         "hid_release_keys" => {
             let mut hid = lock_hid(state);
-            hid.release_all_keys()?;
+            hid.key_release_all()?;
             Ok(vec![text_block("all keyboard keys released")])
         }
         "hid_media_key" => {
@@ -1099,6 +1170,19 @@ fn text_block(t: impl Into<String>) -> Value {
     json!({ "type": "text", "text": t.into() })
 }
 
+/// Human-readable "currently held" keyboard summary: modifiers then keys,
+/// auto-shift folded in (so a held 'A' shows as shift+a).
+fn kb_held_desc(mods: u8, keys: &[ch9329::HeldKey]) -> String {
+    let (eff_mods, usages) = ch9329::Ch9329::kb_frame(mods, keys);
+    let mut parts: Vec<String> = keys::modifier_names(eff_mods).into_iter().map(String::from).collect();
+    parts.extend(usages.iter().map(|u| keys::usage_name(*u)));
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join("+")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,6 +1203,23 @@ mod tests {
         // Must log and return, not panic or block forever, when the tty is
         // missing (the normal boot case before the CH340 enumerates).
         cleanup_hid(&state, "test");
+    }
+
+    #[test]
+    fn key_hold_state_survives_failed_tool_calls() {
+        // Without a serial device every send fails, so the held-key tracking
+        // must stay empty for press/click (mirrors the mouse rollback rule).
+        let state = Arc::new(test_state("/nonexistent-usb-mcp-test"));
+        let err = call_tool(&state, "hid_key_press", &json!({"keys": ["a"], "action": "press"}))
+            .expect_err("press must fail without a serial device");
+        assert!(err.contains("open"), "unexpected error: {err}");
+        assert_eq!(state.hid.lock().unwrap().kb_state(), (0, Vec::new()));
+        let _ = call_tool(&state, "hid_key_press", &json!({"keys": ["b"]}));
+        assert_eq!(state.hid.lock().unwrap().kb_state(), (0, Vec::new()));
+        // an unknown action is rejected before touching the device
+        let err = call_tool(&state, "hid_key_press", &json!({"keys": ["b"], "action": "bogus"}))
+            .expect_err("bogus action must be rejected");
+        assert!(err.contains("action"), "unexpected error: {err}");
     }
 
     #[test]

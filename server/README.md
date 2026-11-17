@@ -97,10 +97,10 @@ curl -i -X POST http://pi-mcp.lan:8765/mcp \
 |---|---|
 | `capture_info` | UVC デバイス一覧（driver=uvcvideo のみ。bcm2835-codec/isp 等のプラットフォームノードは除外）・対応フォーマット（text） |
 | `capture_frame` | 1 フレーム取得。YUYV 生取り込み → 可逆 PNG（flate2 deflate 圧縮、`image` クレート / 純Rust）。信号変化を確実に追随するため、画素差分・文字可読性の検証に向く（数百KB）。**MJPEG(JPEG) モードは 2026-11-08 廃止**（先頭ヘッダ破損、フォーマット/信号切替直後に MS2109 の古いノーシグナルカラーバーが残る）。warmup ストリーム破棄付き。`skip=既定2` で先頭フレーム不安定対策（サイズ検証 + 自動リトライ）。**モード追加（2026-11-08）**: `mode=image`（既定、PNG のみ）/ `mode=diff`（前回キャプチャとの変化画素数 % と bbox をテキストのみで返す。画像を送らない低コストな「画面動いた？」確認。ベースラインはデバイスごとにメモリ内、再起動・解像度変更でリセット）/ `mode=both`（統計 + PNG）。`region={x,y,w,h}` で矩形クロップ（境界超過はクランプ、原点外はエラー。diff の計測範囲にもなる）。`diff_threshold`（既定12、0=ビット完全一致。ライブ信号のノイズ対策）。diff は RGB 変換前の YUYV バイト比較（閾値超で Y=個別画素、U/V=ペア2画素に反映） |
-| `hid_status` | GET_INFO。firmware と **usb_status（0x01=ターゲットが HID 認識済み）** を確認。セッション開始時に推奨 |
-| `hid_key_press` | 修飾キー + 同時押し（最大6キー）→ hold → 全解放 |
-| `hid_type_text` | 文字列入力（US 配列 ASCII、shift 自動） |
-| `hid_release_keys` | 全キー解放（固着キー救出用、安全） |
+| `hid_status` | GET_INFO。firmware と **usb_status（0x01=ターゲットが HID 認識済み）** を確認。セッション開始時に推奨。保持中のマウスボタン・キーがあれば表示 |
+| `hid_key_press` | キー操作（`action` 付き）。`action=click`（既定）は**保持中のキーの上に重ねて**同時押し（最大6キー）→ hold → 保持状態へ復元。`action=press` は**ツールコールをまたいでキー/修飾キーを保持**（ホールド修飾キー・長押し・スタッキー）、`action=release` でそのキー/修飾キーだけ解放（他の保持は維持）。保持中は以降の click や `hid_type_text` にも合成される（計6キー上限、超過は送信前エラー） |
+| `hid_type_text` | 文字列入力（US 配列 ASCII、shift 自動）。キー保持中（`action=press`）は文字ごとに保持キーへ**重ね打ち**し、文字間はゼロレポートではなく保持状態へ復元 |
+| `hid_release_keys` | 保持中を含む**全キー解放**（ゼロレポート + サーバー側の保持状態もクリア）。固着キー救出用・中断後の復旧用で安全な no-op |
 | `hid_media_key` | メディアキー（CMD 0x03）。**ACPI（power/sleep）は意図的に非実装** |
 | `hid_mouse_move` | 相対移動（推奨）。±127 で自動分割 |
 | `hid_mouse_click` | 左/右/中クリック（相対フレーム経由）。`action=click`（既定）は `hold_ms` 後に解放、`action=press` は**ツールコールをまたいで押下を保持**（ドラッグ用）、`action=release` でそのボタンを解放。保持中は `hid_mouse_move` / `hid_mouse_scroll` の全フレームにもボタンビットが OR される |
@@ -114,6 +114,7 @@ curl -i -X POST http://pi-mcp.lan:8765/mcp \
   （V1.4 ファームウェアで USB 側が消える事故の教訓、`third-party/wch/ch9329-spec.md` §5 警告）。拒否は単体テスト済み
 - ボタン/ホイールは絶対フレームでは送らない（本基板では Linux に到達しないため、実測（§13））。絶対フレームのボタンバイトは保持中ビットのミラーのみ
 - マウス押下状態はサーバー（`Ch9329.held_buttons`）が保持し、移動・スクロールを含む全相対フレームに含める。`action=press` の押しっぱなしは次回以降のツールコールでも維持され、`action=release` / `hid_mouse_release` で解除する。サーバー起動時と停止時（SIGTERM/SIGINT）にキーボード全解放＋0 ボタンフレームを best-effort 送信して残留状態を掃除する（デバイス未接続時はログのみ。停止時は HID mutex を最大 2 秒待ってから諦める）
+- キーボード押下状態も同じ設計（2026-11-17）。`hid_key_press action=press` で押したキー（usage + auto-shift 寄与）と修飾キービットを `Ch9329.held_keys` / `held_mods` が保持し、CMD 0x02 のレポートは常に全キー状態を運ぶため、以降の click（保持の上に合成して保持状態へ復元）や `hid_type_text`（文字間の復元フレームがゼロではなく保持状態）でも維持される。解除は `action=release` / `hid_release_keys`。同時 6 キー超過は送信前エラー、送信失敗時はロールバック（単体テスト + pty テストで合成・解放フレーム列を検証済み）
 - 全フレーム SUM は自動計算。SUM 不一致はターゲット注入ゼロで E4 として返る
 - ACK 待ち 500ms。ゴミバイトからの再同期、V1.4 の 5 バイト短縮 ACK both 対応。**送信前に入力バッファを flush**（タイムアウト後に遅れて届いた ACK を次のコマンドの ACK と誤認しない）、**`TIOCEXCL` で tty を排他**（二重起動時のフレーム混線防止）、**write は 500ms タイムアウト**（UART 詰まりで HID mutex を保持したままハングしない）。ACK タイムアウト時はポートを閉じ、次のコマンドで開き直す
 

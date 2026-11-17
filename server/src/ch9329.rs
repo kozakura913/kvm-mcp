@@ -15,6 +15,9 @@
 //!   not a sequence number).
 //! - Writes have a 500 ms deadline; a wedged tty closes the port instead of
 //!   blocking the HID mutex forever.
+//! - Held mouse buttons and held keyboard keys live in this driver: every
+//!   relative-mouse frame and every keyboard report carries the FULL held
+//!   state, so later frames cannot implicitly release an earlier press.
 
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -52,10 +55,38 @@ pub fn build_frame(addr: u8, cmd: u8, data: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Merge `add` into `current` (one slot per usage; the latest press decides
+/// the shift contribution). Errors when the report would need more than the
+/// six key slots a USB HID keyboard has — before anything is sent.
+pub fn merge_held_keys(current: &[HeldKey], add: &[HeldKey]) -> Result<Vec<HeldKey>, String> {
+    let mut out: Vec<HeldKey> = current.to_vec();
+    for k in add {
+        match out.iter().position(|h| h.usage == k.usage) {
+            Some(pos) => out[pos] = *k,
+            None => out.push(*k),
+        }
+    }
+    if out.len() > 6 {
+        return Err(format!(
+            "USB HID keyboards report at most 6 simultaneous keys ({} here)",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 struct RawFrame {
     cmd: u8,
     data: Vec<u8>,
+}
+
+/// One keyboard key held down: HID usage + whether it contributes the
+/// auto-shift bit (uppercase / symbol keys need Shift on a US layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldKey {
+    pub usage: u8,
+    pub shift: bool,
 }
 
 pub struct Ch9329 {
@@ -66,6 +97,12 @@ pub struct Ch9329 {
     /// Every relative-mouse frame carries the full button state, so a move or
     /// scroll must include these bits or it would implicitly release them.
     held_buttons: u8,
+    /// Keyboard keys/modifiers currently held down (same idea as held_buttons,
+    /// for hid_key_press action=press). The general-keyboard report (CMD 0x02)
+    /// always carries the full key state, so every report the driver builds
+    /// must include these or it would implicitly release them.
+    held_keys: Vec<HeldKey>,
+    held_mods: u8,
 }
 
 fn errno() -> i32 {
@@ -78,7 +115,14 @@ fn err_str() -> String {
 
 impl Ch9329 {
     pub fn new(path: String, baud: u32) -> Self {
-        Self { path, baud, file: None, held_buttons: 0 }
+        Self {
+            path,
+            baud,
+            file: None,
+            held_buttons: 0,
+            held_keys: Vec::new(),
+            held_mods: 0,
+        }
     }
 
     fn fd(&self) -> Option<i32> {
@@ -332,7 +376,9 @@ impl Ch9329 {
         Ok(Info { version: data[0], usb_status: data[1], led: data[2], raw: data })
     }
 
-    /// SEND_KB_GENERAL_DATA (CMD 0x02): modifiers, reserved 0, six usage IDs.
+    /// SEND_KB_GENERAL_DATA (CMD 0x02): raw report (modifiers, reserved 0, six
+    /// usage IDs) without touching the held-key state. Held-state composition
+    /// goes through key_press/key_release/kb_frame.
     pub fn kb_report(&mut self, modifiers: u8, keys: &[u8]) -> Result<(), String> {
         let mut data = [0u8; 8];
         data[0] = modifiers;
@@ -342,8 +388,56 @@ impl Ch9329 {
         self.send_cmd(0x02, &data).map(|_| ())
     }
 
-    pub fn release_all_keys(&mut self) -> Result<(), String> {
-        self.kb_report(0, &[])
+    /// Effective report for a keyboard state: explicit modifier bits ORed with
+    /// the auto-shift contributed by uppercase/symbol keys.
+    pub fn kb_frame(modifiers: u8, keys: &[HeldKey]) -> (u8, Vec<u8>) {
+        let mods = modifiers | if keys.iter().any(|k| k.shift) { 0x02 } else { 0 };
+        (mods, keys.iter().map(|k| k.usage).collect())
+    }
+
+    /// Send `mods`/`keys` as the new held keyboard state; on failure keep the
+    /// previous state (the target never received the frame, so the old state
+    /// is still truth).
+    fn set_held_keys(&mut self, mods: u8, keys: Vec<HeldKey>) -> Result<(), String> {
+        let prev_mods = self.held_mods;
+        let prev_keys = std::mem::replace(&mut self.held_keys, keys);
+        self.held_mods = mods;
+        let (m, u) = Self::kb_frame(self.held_mods, &self.held_keys);
+        if let Err(e) = self.kb_report(m, &u) {
+            self.held_mods = prev_mods;
+            self.held_keys = prev_keys;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Press keys/modifiers and KEEP them held across later calls.
+    pub fn key_press(&mut self, modifiers: u8, keys: &[HeldKey]) -> Result<(), String> {
+        let next = merge_held_keys(&self.held_keys, keys)?;
+        self.set_held_keys(self.held_mods | modifiers, next)
+    }
+
+    /// Release the given usages and modifier bits; everything else stays held.
+    /// Usages match regardless of the shift contribution they were pressed with.
+    pub fn key_release(&mut self, modifiers: u8, usages: &[u8]) -> Result<(), String> {
+        let next: Vec<HeldKey> = self
+            .held_keys
+            .iter()
+            .copied()
+            .filter(|k| !usages.contains(&k.usage))
+            .collect();
+        self.set_held_keys(self.held_mods & !modifiers, next)
+    }
+
+    /// Release every held key and modifier (zero report; also clears residual
+    /// state from a previous server process; safe no-op when nothing is held).
+    pub fn key_release_all(&mut self) -> Result<(), String> {
+        self.set_held_keys(0, Vec::new())
+    }
+
+    /// Held keyboard state (for status output and frame composition).
+    pub fn kb_state(&self) -> (u8, Vec<HeldKey>) {
+        (self.held_mods, self.held_keys.clone())
     }
 
     /// One relative-mouse frame (CMD 0x05): [0x01][buttons][X][Y][wheel].
@@ -580,6 +674,33 @@ mod tests {
     }
 
     #[test]
+    fn held_keys_roll_back_when_send_fails() {
+        // Same rule as the mouse buttons: a failed send must not mutate state.
+        let mut h = Ch9329::new("/nonexistent".into(), 9600);
+        let a = HeldKey { usage: 0x04, shift: false };
+        assert!(h.key_press(0x01, &[a]).is_err());
+        assert_eq!(h.kb_state(), (0, Vec::new()));
+        assert!(h.key_release_all().is_err());
+        assert_eq!(h.kb_state(), (0, Vec::new()));
+    }
+
+    #[test]
+    fn held_key_merge_caps_at_six_and_folds_auto_shift() {
+        let base: Vec<HeldKey> = (0x04..0x0A).map(|u| HeldKey { usage: u, shift: false }).collect();
+        assert_eq!(base.len(), 6);
+        // same usage pressed again: replaces the slot (shift contribution updated), no overflow
+        let merged = merge_held_keys(&base, &[HeldKey { usage: 0x04, shift: true }]).unwrap();
+        assert_eq!(merged.len(), 6);
+        assert!(merged.contains(&HeldKey { usage: 0x04, shift: true }));
+        // a 7th distinct key is refused before anything is sent
+        assert!(merge_held_keys(&base, &[HeldKey { usage: 0x0B, shift: false }]).is_err());
+        // the effective report folds auto-shift into the modifier byte
+        let (mods, usages) = Ch9329::kb_frame(0x01, &[HeldKey { usage: 0x04, shift: true }]);
+        assert_eq!(mods, 0x01 | 0x02);
+        assert_eq!(usages, vec![0x04]);
+    }
+
+    #[test]
     fn parses_normal_and_short_ack() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0x00, 0x11, 0x22]); // garbage before header (resync)
@@ -789,5 +910,36 @@ mod pty_tests {
             err_str()
         );
         h.close_port();
+    }
+
+    #[test]
+    fn keyboard_hold_composes_across_calls_and_releases() {
+        // The pty master records the three CMD 0x02 reports: press 'a', then
+        // press ctrl+'b' on TOP of it (the held key must still be in frame 2),
+        // then release everything.
+        let Some(pty) = open_pty() else {
+            return;
+        };
+        let master = pty.master;
+        let responder = thread::spawn(move || {
+            let mut reports = Vec::new();
+            for _ in 0..3 {
+                let mut f = [0u8; 14]; // 57 AB 00 02 08 <8 data> SUM
+                read_exact_fd(master, &mut f);
+                assert_eq!(&f[..5], &[0x57, 0xAB, 0x00, 0x02, 0x08], "unexpected kb frame {f:02X?}");
+                reports.push(f[5..13].to_vec());
+                write_fd(master, &build_frame(0x00, 0x82, &[]));
+            }
+            reports
+        });
+
+        let mut h = Ch9329::new(pty.slave_path.clone(), 9600);
+        h.key_press(0, &[HeldKey { usage: 0x04, shift: false }]).expect("press a");
+        h.key_press(0x01, &[HeldKey { usage: 0x05, shift: false }]).expect("press ctrl+b");
+        h.key_release_all().expect("release all");
+        let reports = responder.join().unwrap();
+        assert_eq!(reports[0], [0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00], "frame 1: 'a' down");
+        assert_eq!(reports[1], [0x01, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00], "frame 2 must keep 'a' held");
+        assert_eq!(reports[2], [0x00; 8], "frame 3: all released");
     }
 }

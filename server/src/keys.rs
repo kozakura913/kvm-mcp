@@ -182,6 +182,86 @@ pub fn mouse_buttons_desc(bits: u8) -> String {
     }
 }
 
+/// Modifier byte → names in bit order (for held-key status output).
+pub fn modifier_names(bits: u8) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for (bit, name) in [
+        (0x01, "ctrl"),
+        (0x02, "shift"),
+        (0x04, "alt"),
+        (0x08, "win"),
+        (0x10, "rctrl"),
+        (0x20, "rshift"),
+        (0x40, "ralt"),
+        (0x80, "rwin"),
+    ] {
+        if bits & bit != 0 {
+            v.push(name);
+        }
+    }
+    v
+}
+
+/// Best-effort key name for a HID usage id (status output only; falls back to
+/// the raw hex form for usages outside the US-layout table).
+pub fn usage_name(usage: u8) -> String {
+    match usage {
+        0x04..=0x1D => ((b'a' + (usage - 0x04)) as char).to_string(),
+        0x1E..=0x26 => ((b'1' + (usage - 0x1E)) as char).to_string(),
+        0x27 => "0".into(),
+        0x28 => "enter".into(),
+        0x29 => "esc".into(),
+        0x2A => "backspace".into(),
+        0x2B => "tab".into(),
+        0x2C => "space".into(),
+        0x2D => "-".into(),
+        0x2E => "=".into(),
+        0x2F => "[".into(),
+        0x30 => "]".into(),
+        0x31 => "\\".into(),
+        0x33 => ";".into(),
+        0x34 => "'".into(),
+        0x35 => "`".into(),
+        0x36 => ",".into(),
+        0x37 => ".".into(),
+        0x38 => "/".into(),
+        0x39 => "capslock".into(),
+        0x3A..=0x45 => format!("f{}", usage - 0x39),
+        0x46 => "printscreen".into(),
+        0x47 => "scrolllock".into(),
+        0x48 => "pause".into(),
+        0x49 => "insert".into(),
+        0x4A => "home".into(),
+        0x4B => "pageup".into(),
+        0x4C => "delete".into(),
+        0x4D => "end".into(),
+        0x4E => "pagedown".into(),
+        0x4F => "right".into(),
+        0x50 => "left".into(),
+        0x51 => "down".into(),
+        0x52 => "up".into(),
+        0x53 => "numlock".into(),
+        0x54 => "kp_divide".into(),
+        0x55 => "kp_multiply".into(),
+        0x56 => "kp_minus".into(),
+        0x57 => "kp_plus".into(),
+        0x58 => "kp_enter".into(),
+        0x59 => "kp_1".into(),
+        0x5A => "kp_2".into(),
+        0x5B => "kp_3".into(),
+        0x5C => "kp_4".into(),
+        0x5D => "kp_5".into(),
+        0x5E => "kp_6".into(),
+        0x5F => "kp_7".into(),
+        0x60 => "kp_8".into(),
+        0x61 => "kp_9".into(),
+        0x62 => "kp_0".into(),
+        0x63 => "kp_dot".into(),
+        0x65 => "app".into(),
+        _ => format!("0x{usage:02X}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +295,20 @@ mod tests {
         assert_eq!(mouse_button_bit("middle").unwrap(), 0x04);
         assert_eq!(mouse_buttons_desc(0), "none");
         assert_eq!(mouse_buttons_desc(0x01 | 0x04), "left+middle");
+    }
+
+    #[test]
+    fn held_key_status_names() {
+        assert_eq!(modifier_names(0x01 | 0x02), vec!["ctrl", "shift"]);
+        assert!(modifier_names(0).is_empty());
+        assert_eq!(usage_name(0x04), "a");
+        assert_eq!(usage_name(0x1D), "z");
+        assert_eq!(usage_name(0x1E), "1");
+        assert_eq!(usage_name(0x27), "0");
+        assert_eq!(usage_name(0x28), "enter");
+        assert_eq!(usage_name(0x3E), "f5");
+        assert_eq!(usage_name(0x50), "left");
+        assert_eq!(usage_name(0x62), "kp_0");
+        assert_eq!(usage_name(0x00), "0x00");
     }
 }
